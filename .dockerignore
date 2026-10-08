@@ -33,6 +33,7 @@ LICENSE
 # Misc data files that shouldn't ship in the image
 *.csv
 *.docx
+.handoff/
 
 # Windows-only helper script
 update.bat

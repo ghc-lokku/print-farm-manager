@@ -89,7 +89,8 @@ beforeEach(() => {
       material_grams    REAL,
       allowed_groups    TEXT,
       required_material TEXT,
-      required_color    TEXT
+      required_color    TEXT,
+      plate_no          INTEGER
     );
     CREATE TABLE jobs (
       id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,12 +123,28 @@ beforeEach(() => {
       id    INTEGER PRIMARY KEY AUTOINCREMENT,
       name  TEXT NOT NULL UNIQUE
     );
+    CREATE TABLE filament_brands (
+      id    INTEGER PRIMARY KEY AUTOINCREMENT,
+      name  TEXT NOT NULL UNIQUE
+    );
     CREATE TABLE filament_colors (
       id        INTEGER PRIMARY KEY AUTOINCREMENT,
       type_id   INTEGER NOT NULL REFERENCES filament_types(id),
       name      TEXT NOT NULL,
+      brand     TEXT,
       hex_color TEXT,
-      UNIQUE(type_id, name)
+      UNIQUE(type_id, name, brand)
+    );
+    CREATE TABLE project_tags (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      name        TEXT NOT NULL UNIQUE,
+      created_at  INTEGER NOT NULL
+    );
+    CREATE TABLE project_tag_links (
+      project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      tag_id      INTEGER NOT NULL REFERENCES project_tags(id) ON DELETE CASCADE,
+      created_at  INTEGER NOT NULL,
+      PRIMARY KEY (project_id, tag_id)
     );
     CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   `);
@@ -156,10 +173,10 @@ beforeEach(() => {
   db.prepare(`
     INSERT INTO gcodes
       (part_id, printer_model, filename, filepath, parts_per_plate, est_print_secs, created_at,
-       ams_slot, material_grams, allowed_groups, required_material, required_color)
+       ams_slot, material_grams, allowed_groups, required_material, required_color, plate_no)
     VALUES
       (1, 'x1c', 'part.gcode', 'part_stub.gcode', 4, 3600, ?,
-       2, 45.5, '["Bambu Farm"]', 'PETG', 'Red')
+       2, 45.5, '["Bambu Farm"]', 'PETG', 'Red', 3)
   `).run(now);
 
   // Two types/colors (not one) so a restore that gets the filament_colors -> filament_types
@@ -168,8 +185,14 @@ beforeEach(() => {
   db.prepare(`INSERT INTO printer_groups (name, created_at) VALUES ('Bambu Farm', ?)`).run(now);
   db.prepare(`INSERT INTO filament_types (name) VALUES ('PLA')`).run();
   db.prepare(`INSERT INTO filament_types (name) VALUES ('PETG')`).run();
-  db.prepare(`INSERT INTO filament_colors (type_id, name, hex_color) VALUES (1, 'Galaxy Black', '#1a1a1a')`).run();
-  db.prepare(`INSERT INTO filament_colors (type_id, name, hex_color) VALUES (2, 'Signal Red', '#cc0000')`).run();
+  db.prepare(`INSERT INTO filament_brands (name) VALUES ('Bambu')`).run();
+  db.prepare(`INSERT INTO filament_brands (name) VALUES ('Polymaker')`).run();
+  db.prepare(`INSERT INTO filament_colors (type_id, name, brand, hex_color) VALUES (1, 'Galaxy Black', 'Bambu', '#1a1a1a')`).run();
+  db.prepare(`INSERT INTO filament_colors (type_id, name, brand, hex_color) VALUES (2, 'Signal Red', 'Polymaker', '#cc0000')`).run();
+  db.prepare(`INSERT INTO project_tags (name, created_at) VALUES ('rush', ?)`).run(now);
+  db.prepare(`INSERT INTO project_tags (name, created_at) VALUES ('yellow', ?)`).run(now);
+  db.prepare(`INSERT INTO project_tag_links (project_id, tag_id, created_at) VALUES (1, 1, ?)`).run(now);
+  db.prepare(`INSERT INTO project_tag_links (project_id, tag_id, created_at) VALUES (1, 2, ?)`).run(now);
   db.prepare(`INSERT INTO settings (key, value) VALUES ('farm_name', 'Test Farm')`).run();
   db.prepare(`INSERT INTO settings (key, value) VALUES ('dispatch_batch_size', '5')`).run();
 
@@ -214,6 +237,7 @@ describe('Backup export/restore — column round-trip regression', () => {
       allowed_groups: '["Bambu Farm"]',
       required_material: 'PETG',
       required_color: 'Red',
+      plate_no: 3,
     });
   });
 
@@ -228,7 +252,7 @@ describe('Backup export/restore — column round-trip regression', () => {
       db.prepare("UPDATE printers SET serial_number = '', loaded_material = NULL, loaded_color = NULL").run();
       db.prepare("UPDATE projects SET required_material = NULL, required_color = NULL, allowed_groups = NULL").run();
       db.prepare("UPDATE parts SET print_time_seconds = NULL, material_grams = NULL").run();
-      db.prepare("UPDATE gcodes SET ams_slot = NULL, material_grams = NULL, allowed_groups = NULL, required_material = NULL, required_color = NULL").run();
+      db.prepare("UPDATE gcodes SET ams_slot = NULL, material_grams = NULL, allowed_groups = NULL, required_material = NULL, required_color = NULL, plate_no = NULL").run();
 
       const restoreRes = await request(app)
         .post('/api/backup/restore')
@@ -257,6 +281,7 @@ describe('Backup export/restore — column round-trip regression', () => {
       expect(gcode.allowed_groups).toBe('["Bambu Farm"]');
       expect(gcode.required_material).toBe('PETG');
       expect(gcode.required_color).toBe('Red');
+      expect(gcode.plate_no).toBe(3);
     } finally {
       fs.unlinkSync(backupFile);
     }
@@ -316,8 +341,8 @@ describe('Backup export/restore — column round-trip regression', () => {
 // settings — the four tables this PR originally added to backup/restore — leaving both the
 // round trip (including the filament_colors -> filament_types FK order) and the
 // older-backup compatibility guard (missing keys must leave existing config alone) untested.
-describe('Backup export/restore: config tables (printer models, printer groups, filament library, settings)', () => {
-  test('export includes printer_models, printer_groups, filament_types, filament_colors, and settings', async () => {
+describe('Backup export/restore: config tables (printer models, printer groups, filament library, project tags, settings)', () => {
+  test('export includes printer_models, printer_groups, filament_types, filament_brands, filament_colors, project tags, and settings', async () => {
     const res = await request(app).get('/api/backup');
     expect(res.status).toBe(200);
 
@@ -330,10 +355,28 @@ describe('Backup export/restore: config tables (printer models, printer groups, 
     expect(res.body.filament_types).toEqual(
       expect.arrayContaining([expect.objectContaining({ name: 'PLA' }), expect.objectContaining({ name: 'PETG' })])
     );
+    expect(res.body.filament_brands).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'Bambu' }),
+        expect.objectContaining({ name: 'Polymaker' }),
+      ])
+    );
     expect(res.body.filament_colors).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ name: 'Galaxy Black', hex_color: '#1a1a1a' }),
-        expect.objectContaining({ name: 'Signal Red', hex_color: '#cc0000' }),
+        expect.objectContaining({ name: 'Galaxy Black', brand: 'Bambu', hex_color: '#1a1a1a' }),
+        expect.objectContaining({ name: 'Signal Red', brand: 'Polymaker', hex_color: '#cc0000' }),
+      ])
+    );
+    expect(res.body.project_tags).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'rush' }),
+        expect.objectContaining({ name: 'yellow' }),
+      ])
+    );
+    expect(res.body.project_tag_links).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ project_id: 1, tag_id: 1 }),
+        expect.objectContaining({ project_id: 1, tag_id: 2 }),
       ])
     );
     expect(res.body.settings).toEqual(
@@ -344,7 +387,7 @@ describe('Backup export/restore: config tables (printer models, printer groups, 
     );
   });
 
-  test('restore round-trips printer models, filament library (preserving type/color FK relationships), and settings', async () => {
+  test('restore round-trips printer models, filament library (preserving type/color/brand relationships), project tags, and settings', async () => {
     const exportRes = await request(app).get('/api/backup');
     expect(exportRes.status).toBe(200);
     const backupFile = writeTempBackupFile(exportRes.body);
@@ -362,8 +405,11 @@ describe('Backup export/restore: config tables (printer models, printer groups, 
       // of 200 below.
       db.prepare("UPDATE filament_colors SET hex_color = '#000000'").run();
       db.prepare("UPDATE filament_types SET name = name || '-wiped'").run(); // keeps UNIQUE(name) satisfied
+      db.prepare("UPDATE filament_brands SET name = name || '-wiped'").run();
       db.prepare("UPDATE printer_models SET label = 'Wiped'").run();
       db.prepare("UPDATE printer_groups SET created_at = 0").run();
+      db.prepare("UPDATE project_tags SET name = name || '-wiped'").run();
+      db.prepare('DELETE FROM project_tag_links').run();
       db.prepare("UPDATE settings SET value = 'Wiped Farm' WHERE key = 'farm_name'").run();
 
       const restoreRes = await request(app).post('/api/backup/restore').attach('file', backupFile);
@@ -372,7 +418,10 @@ describe('Backup export/restore: config tables (printer models, printer groups, 
       expect(restoreRes.body.printer_models).toBe(1);
       expect(restoreRes.body.printer_groups).toBe(1);
       expect(restoreRes.body.filament_types).toBe(2);
+      expect(restoreRes.body.filament_brands).toBe(2);
       expect(restoreRes.body.filament_colors).toBe(2);
+      expect(restoreRes.body.project_tags).toBe(2);
+      expect(restoreRes.body.project_tag_links).toBe(2);
 
       const model = db.prepare('SELECT * FROM printer_models WHERE model_id = ?').get('x1c');
       expect(model).toMatchObject({ label: 'Bambu X1 Carbon', connector: 'bambu' });
@@ -391,12 +440,22 @@ describe('Backup export/restore: config tables (printer models, printer groups, 
       expect(black.hex_color).toBe('#1a1a1a');
 
       const red = db.prepare(`
-        SELECT ft.name AS type_name, fc.hex_color FROM filament_colors fc
+        SELECT ft.name AS type_name, fc.brand, fc.hex_color FROM filament_colors fc
         JOIN filament_types ft ON ft.id = fc.type_id
         WHERE fc.name = 'Signal Red'
       `).get();
       expect(red.type_name).toBe('PETG');
+      expect(red.brand).toBe('Polymaker');
       expect(red.hex_color).toBe('#cc0000');
+
+      const brands = db.prepare('SELECT name FROM filament_brands ORDER BY name').all().map((b) => b.name);
+      expect(brands).toEqual(['Bambu', 'Polymaker']);
+
+      const tags = db.prepare('SELECT name FROM project_tags ORDER BY name').all().map(t => t.name);
+      expect(tags).toEqual(['rush', 'yellow']);
+
+      const links = db.prepare('SELECT project_id, tag_id FROM project_tag_links ORDER BY tag_id').all();
+      expect(links).toEqual([{ project_id: 1, tag_id: 1 }, { project_id: 1, tag_id: 2 }]);
 
       const farmName = db.prepare("SELECT value FROM settings WHERE key = 'farm_name'").get();
       expect(farmName.value).toBe('Test Farm');
@@ -405,7 +464,7 @@ describe('Backup export/restore: config tables (printer models, printer groups, 
     }
   });
 
-  test('restoring an older backup missing printer_models/printer_groups/filament/settings keys leaves current config untouched', async () => {
+  test('restoring an older backup missing printer_models/printer_groups/filament/project-tag/settings keys leaves current config untouched', async () => {
     const exportRes = await request(app).get('/api/backup');
     const backup = exportRes.body;
     // Simulate a pre-this-feature backup: strip the keys entirely rather than leaving
@@ -413,7 +472,10 @@ describe('Backup export/restore: config tables (printer models, printer groups, 
     delete backup.printer_models;
     delete backup.printer_groups;
     delete backup.filament_types;
+    delete backup.filament_brands;
     delete backup.filament_colors;
+    delete backup.project_tags;
+    delete backup.project_tag_links;
     delete backup.settings;
     const backupFile = writeTempBackupFile(backup);
 
@@ -433,6 +495,15 @@ describe('Backup export/restore: config tables (printer models, printer groups, 
 
       const colors = db.prepare('SELECT name FROM filament_colors ORDER BY name').all().map(c => c.name);
       expect(colors).toEqual(['Galaxy Black', 'Signal Red']);
+
+      const brands = db.prepare('SELECT name FROM filament_brands ORDER BY name').all().map((b) => b.name);
+      expect(brands).toEqual(['Bambu', 'Polymaker']);
+
+      const tags = db.prepare('SELECT name FROM project_tags ORDER BY name').all().map(t => t.name);
+      expect(tags).toEqual(['rush', 'yellow']);
+
+      const links = db.prepare('SELECT project_id, tag_id FROM project_tag_links ORDER BY tag_id').all();
+      expect(links).toEqual([{ project_id: 1, tag_id: 1 }, { project_id: 1, tag_id: 2 }]);
 
       const farmName = db.prepare("SELECT value FROM settings WHERE key = 'farm_name'").get();
       expect(farmName.value).toBe('Test Farm');

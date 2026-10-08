@@ -32,6 +32,14 @@ const LEGEND_ITEMS = [
   { label: 'Offline',  color: '#374151' },
 ];
 
+const COLOR_NAME_TO_HEX = {
+  black: '#000000', white: '#FFFFFF', red: '#FF0000', green: '#008000', blue: '#0000FF',
+  yellow: '#FFFF00', orange: '#FFA500', purple: '#800080', pink: '#FFC0CB', brown: '#A52A2A',
+  gray: '#808080', grey: '#808080', silver: '#C0C0C0', cyan: '#00FFFF', magenta: '#FF00FF',
+  teal: '#008080', maroon: '#800000', navy: '#000080', olive: '#808000', lime: '#00FF00',
+  fuchsia: '#FF00FF', aqua: '#00FFFF', tan: '#D2B48C', gold: '#FFD700', beige: '#F5F5DC',
+};
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function cellColors(printer) {
@@ -77,6 +85,74 @@ function formatMaterial(grams) {
   return `${kg}kg`;
 }
 
+function normalizeHexColor(value) {
+  if (!value || typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const hex = trimmed.replace(/^#/, '').split(',')[0].trim();
+  if (/^[0-9A-Fa-f]{6}$/.test(hex)) return `#${hex.toUpperCase()}`;
+  return null;
+}
+
+function resolveColorSwatches(values, filamentColors = []) {
+  const colorByName = new Map();
+  for (const c of filamentColors) {
+    if (!c?.name || !c?.hex_color) continue;
+    const hex = normalizeHexColor(c.hex_color);
+    if (!hex) continue;
+    colorByName.set(String(c.name).toLowerCase(), hex);
+  }
+
+  const swatches = [];
+  const seen = new Set();
+  for (const v of values || []) {
+    if (!v) continue;
+    const candidate = String(v).trim();
+    if (!candidate) continue;
+    const lower = candidate.toLowerCase();
+    const hex = normalizeHexColor(candidate)
+      || colorByName.get(lower)
+      || COLOR_NAME_TO_HEX[lower]
+      || null;
+    if (hex && !seen.has(hex)) {
+      seen.add(hex);
+      swatches.push({ name: candidate, hex });
+    }
+  }
+  return swatches;
+}
+
+function getPartRequiredColors(part) {
+  const fromJson = (() => {
+    if (!part?.required_colors_json) return [];
+    try {
+      const parsed = JSON.parse(part.required_colors_json);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  })();
+  const raw = fromJson.length > 0
+    ? fromJson
+    : (part?.effective_required_color ? [part.effective_required_color] : []);
+
+  // A multi-color plate stores all its colors in one delimited string (parse-3mf
+  // joins them with ', '); split on the same delimiters the scheduler uses so each
+  // color gets its own swatch instead of only the first one showing.
+  const out = [];
+  const seen = new Set();
+  for (const entry of raw) {
+    for (const token of String(entry).split(/[\n,|]/)) {
+      const name = token.trim();
+      if (name && !seen.has(name.toLowerCase())) {
+        seen.add(name.toLowerCase());
+        out.push(name);
+      }
+    }
+  }
+  return out;
+}
+
 // ── Row-level status summary badges for the fleet grid ───────────────────────
 
 const ROW_STATUSES = ['PRINTING', 'FINISHED', 'IDLE', 'ERROR', 'STOPPED', 'OFFLINE'];
@@ -113,11 +189,14 @@ export default function Dashboard() {
   const [data,  setData]  = useState(null);
   const [clock, setClock] = useState(new Date());
   const [allModels, setAllModels] = useState([]);
+  const [filamentColors, setFilamentColors] = useState([]);
   const [lastPolled, setLastPolled] = useState(null);
+  const [collapsedProjects, setCollapsedProjects] = useState({});
   const dashRef = useRef(null);
 
   useEffect(() => {
     fetch('/api/models').then(r => r.json()).then(setAllModels).catch(() => {});
+    fetch('/api/filaments/colors').then(r => r.json()).then(setFilamentColors).catch(() => {});
   }, []);
 
   // 1-second clock
@@ -145,6 +224,13 @@ export default function Dashboard() {
 
   function enterTV() {
     dashRef.current?.requestFullscreen?.();
+  }
+
+  function toggleProjectCollapse(projectId) {
+    setCollapsedProjects(prev => {
+      const current = prev[projectId] ?? true;
+      return { ...prev, [projectId]: !current };
+    });
   }
 
   if (!data) {
@@ -361,12 +447,29 @@ export default function Dashboard() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               {active_projects.map(proj => {
                 const hasStats = (proj.elapsed_secs > 0) || (proj.material_used_grams > 0);
+                const collapsed = collapsedProjects[proj.id] ?? true;
 
                 return (
                   <div key={proj.id} style={{
                     background: '#1e2433', borderRadius: 8, padding: '12px 14px',
                   }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                      <button
+                        onClick={() => toggleProjectCollapse(proj.id)}
+                        title={collapsed ? 'Expand project plates' : 'Collapse project plates'}
+                        style={{
+                          background: '#0f172a',
+                          color: '#cbd5e1',
+                          border: '1px solid #334155',
+                          borderRadius: 4,
+                          padding: '1px 7px',
+                          fontSize: 12,
+                          cursor: 'pointer',
+                          lineHeight: 1.2,
+                        }}
+                      >
+                        {collapsed ? '▸' : '▾'}
+                      </button>
                       <span style={{ fontWeight: 700, fontSize: 14 }}>{proj.name}</span>
                       <span style={{
                         background: '#166534', color: '#4ade80',
@@ -375,10 +478,14 @@ export default function Dashboard() {
                       }}>
                         ACTIVE
                       </span>
+                      <span style={{ color: '#64748b', fontSize: 11 }}>
+                        {proj.parts.length} plate{proj.parts.length === 1 ? '' : 's'}
+                      </span>
                     </div>
 
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    {!collapsed && <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                       {proj.parts.map(part => {
+                        const swatches = resolveColorSwatches(getPartRequiredColors(part), filamentColors);
                         const activeQty    = part.active_qty || 0;
                         const scale        = Math.max(part.target_qty, part.completed_qty + activeQty);
                         const completedPct = scale > 0 ? (part.completed_qty / scale) * 100 : 0;
@@ -394,7 +501,28 @@ export default function Dashboard() {
                               display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                               marginBottom: 4,
                             }}>
-                              <span style={{ fontSize: 12, color: '#e2e8f0', fontWeight: 500 }}>{part.name}</span>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                                <span style={{ fontSize: 12, color: '#e2e8f0', fontWeight: 500 }}>{part.name}</span>
+                                {swatches.length > 0 && (
+                                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                    {swatches.map((swatch, idx) => (
+                                      <span
+                                        key={`${part.id}-${swatch.hex}-${idx}`}
+                                        title={swatch.name}
+                                        style={{
+                                          display: 'inline-block',
+                                          width: 11,
+                                          height: 11,
+                                          borderRadius: 2,
+                                          background: swatch.hex,
+                                          border: '1px solid #334155',
+                                          boxShadow: '0 0 0 1px rgba(15, 23, 42, 0.5)',
+                                        }}
+                                      />
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
                               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                                 <span style={{ fontSize: 12, fontVariantNumeric: 'tabular-nums' }}>
                                   <span style={{ color: '#e2e8f0' }}>{part.completed_qty.toLocaleString()}</span>
@@ -446,7 +574,7 @@ export default function Dashboard() {
                           </div>
                         );
                       })}
-                    </div>
+                    </div>}
 
                     {hasStats && (
                       <div style={{

@@ -1,6 +1,7 @@
 const express = require('express');
 const path    = require('path');
 const fs      = require('fs');
+const { createPrinterColorMatcher, createPrinterMaterialMatcher } = require('../color-matching');
 const router  = express.Router();
 
 const GCODE_DIR = path.join(__dirname, '..', 'gcode');
@@ -8,6 +9,22 @@ const GCODE_DIR = path.join(__dirname, '..', 'gcode');
 // scheduler is optional, only needed at runtime for sweepIdlePrinters when adding a part
 // reactivates a completed project. Tests pass null so there is no live scheduler dependency.
 module.exports = (db, scheduler = null) => {
+  const projectColumns = (() => {
+    try {
+      return db.prepare('PRAGMA table_info(projects)').all().map((c) => c.name);
+    } catch (_) {
+      return [];
+    }
+  })();
+  const gcodeColumns = (() => {
+    try {
+      return db.prepare('PRAGMA table_info(gcodes)').all().map((c) => c.name);
+    } catch (_) {
+      return [];
+    }
+  })();
+  const hasProjectRequiredBrand = projectColumns.includes('required_brand');
+  const hasGcodeRequiredBrand = gcodeColumns.includes('required_brand');
   const ACTIVE_QTY_SQL = `
     COALESCE((
       SELECT SUM(j.parts_per_plate) FROM jobs j
@@ -33,11 +50,13 @@ module.exports = (db, scheduler = null) => {
   // Mirrors the scheduler's eligibility rules (sweepIdlePrinters + candidate query)
   // so operators can self-diagnose "why isn't my part printing" from the UI.
   router.get('/:id/dispatch-status', (req, res) => {
+    const projectBrandExpr = hasProjectRequiredBrand ? 'projects.required_brand' : 'NULL';
     const part = db.prepare(`
       SELECT parts.*, ${ACTIVE_QTY_SQL},
              projects.status            AS project_status,
              projects.required_material AS project_material,
              projects.required_color    AS project_color,
+             ${projectBrandExpr}        AS project_brand,
              projects.allowed_groups    AS project_allowed_groups
       FROM parts JOIN projects ON projects.id = parts.project_id
       WHERE parts.id = ?
@@ -49,6 +68,7 @@ module.exports = (db, scheduler = null) => {
     // blockers and at least one G-code has a ready printer.
     const blockers = [];
     const notes = [];
+    const modelBlocked = new Map();
     let anyGcodeReady = false;
 
     if (part.project_status !== 'active') {
@@ -63,15 +83,44 @@ module.exports = (db, scheduler = null) => {
       blockers.push(`Jobs already printing cover the remaining ${remaining} part(s) — waiting for them to finish`);
     }
 
-    const gcodes = db.prepare('SELECT * FROM gcodes WHERE part_id = ?').all(part.id);
+    const gcodeBrandExpr = hasGcodeRequiredBrand ? 'g.required_brand' : 'NULL AS required_brand';
+    const gcodes = db.prepare(`
+      SELECT g.*
+             ,${gcodeBrandExpr}
+      FROM gcodes g
+      JOIN (
+        SELECT part_id, printer_model, MAX(id) AS max_id
+        FROM gcodes
+        WHERE part_id = ?
+        GROUP BY part_id, printer_model
+      ) latest ON latest.max_id = g.id
+      ORDER BY g.id ASC
+    `).all(part.id);
     if (gcodes.length === 0) {
       blockers.push('No G-code uploaded — upload one per printer model this part can print on');
     }
 
+    // Mixed-model parts can include rows for several printer models (for example
+    // x1c and p2s). If this farm has active printers for at least one of those
+    // models, diagnostics should focus on those reachable models and not report
+    // unrelated blockers for models that do not exist in the active fleet.
+    const activeFleetModels = new Set(
+      db.prepare('SELECT DISTINCT model FROM printers WHERE is_active = 1').all().map(r => r.model)
+    );
+    const reachableModels = new Set(
+      gcodes
+        .map(g => g.printer_model)
+        .filter((model) => activeFleetModels.has(model))
+    );
+    const gcodesToCheck = reachableModels.size > 0
+      ? gcodes.filter((g) => reachableModels.has(g.printer_model))
+      : gcodes;
+
     // Per-gcode printer availability, using the same filters as the scheduler
-    for (const gc of gcodes) {
+    for (const gc of gcodesToCheck) {
       const requiredMaterial = gc.required_material || part.project_material || null;
       const requiredColor    = gc.required_color    || part.project_color    || null;
+      const requiredBrand    = gc.required_brand    || part.project_brand    || null;
       const allowedGroups    = gc.allowed_groups
         ? JSON.parse(gc.allowed_groups)
         : (part.project_allowed_groups ? JSON.parse(part.project_allowed_groups) : null);
@@ -81,40 +130,57 @@ module.exports = (db, scheduler = null) => {
       ).all(gc.printer_model);
 
       if (modelPrinters.length === 0) {
-        notes.push(`${gc.filename}: no active printers of model "${gc.printer_model}"`);
+        modelBlocked.set(gc.printer_model, `${gc.filename}: no active printers of model "${gc.printer_model}"`);
         continue;
       }
 
       const groupOk    = modelPrinters.filter(p => !allowedGroups || allowedGroups.includes(p.group_name));
       if (groupOk.length === 0) {
-        notes.push(`${gc.filename}: no printers in allowed group(s) ${allowedGroups.join(', ')}`);
+        modelBlocked.set(gc.printer_model, `${gc.filename}: no printers in allowed group(s) ${allowedGroups.join(', ')}`);
         continue;
       }
 
-      const materialOk = groupOk.filter(p =>
-        (!requiredMaterial || p.loaded_material === requiredMaterial) &&
-        (!requiredColor    || p.loaded_color    === requiredColor)
-      );
+      const materialOk = groupOk.filter(p => {
+        const matches = createPrinterMaterialMatcher(db, p);
+        return matches(requiredMaterial);
+      });
       if (materialOk.length === 0) {
-        const want = [requiredMaterial, requiredColor].filter(Boolean).join(' / ');
-        notes.push(`${gc.filename}: no printer has ${want} loaded (set it on the printer's detail page)`);
+        const want = requiredMaterial || 'required material';
+        modelBlocked.set(gc.printer_model, `${gc.filename}: no printer has ${want} loaded (set it on the printer's detail page)`);
+        continue;
+      }
+
+      const colorOk = materialOk.filter(p => {
+        const matches = createPrinterColorMatcher(db, p);
+        return matches(requiredColor, requiredMaterial, requiredBrand);
+      });
+      if (colorOk.length === 0) {
+        const want = requiredColor || 'required color';
+        modelBlocked.set(gc.printer_model, `${gc.filename}: no printer has ${want} available (loaded color or Bambu AMS slot)`);
         continue;
       }
 
       // Mirrors sweepIdlePrinters eligibility: unheld STOPPED printers are
       // dispatchable (Bambu latches the stopped state until the next print starts).
-      const ready = materialOk.filter(p =>
+      const ready = colorOk.filter(p =>
         (p.status === 'IDLE' || p.status === 'FINISHED' || p.status === 'STOPPED') && p.is_held === 0
       );
       if (ready.length === 0) {
-        const held = materialOk.filter(p => p.is_held === 1).length;
-        notes.push(
-          `${gc.filename}: all ${materialOk.length} matching printer(s) are busy` +
+        const held = colorOk.filter(p => p.is_held === 1).length;
+        modelBlocked.set(gc.printer_model,
+          `${gc.filename}: all ${colorOk.length} matching printer(s) are busy` +
           (held > 0 ? ` (${held} awaiting operator sign-off)` : '')
         );
       } else {
         anyGcodeReady = true;
       }
+    }
+
+    // If any model is currently dispatchable, suppress per-model blocked notes.
+    // This avoids confusing messages like "waiting on p2s" when an x1c row is
+    // ready and the part can dispatch now.
+    if (!anyGcodeReady) {
+      notes.push(...modelBlocked.values());
     }
 
     const dispatchable = blockers.length === 0 && anyGcodeReady;
@@ -156,6 +222,27 @@ module.exports = (db, scheduler = null) => {
     }
 
     res.status(201).json(db.prepare('SELECT * FROM parts WHERE id = ?').get(result.lastInsertRowid));
+  });
+
+  // Queue exactly one plate for this part, ignoring normal part priority for a
+  // single dispatch attempt.
+  router.post('/:id/queue-one', async (req, res) => {
+    if (!scheduler || typeof scheduler.queueSinglePlateForPart !== 'function') {
+      return res.status(503).json({ error: 'Scheduler is unavailable' });
+    }
+
+    const partId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(partId) || partId < 1) {
+      return res.status(400).json({ error: 'Invalid part id' });
+    }
+
+    try {
+      const result = await scheduler.queueSinglePlateForPart(partId);
+      if (!result.ok) return res.status(result.status || 409).json({ error: result.error || 'Queue failed' });
+      return res.json(result);
+    } catch (err) {
+      return res.status(500).json({ error: err.message || 'Queue failed' });
+    }
   });
 
   // PUT /api/parts/reorder — set sort_order for a list of part IDs

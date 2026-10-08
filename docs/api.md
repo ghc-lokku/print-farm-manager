@@ -70,6 +70,14 @@ Returns `[]` if no active Bambu printer of that model is connected or the model 
 
 `slot` values: `0–N` = AMS tray (compound id: `ams_unit * 4 + tray_id`), `-1` = external spool.
 
+### `GET /api/printers/:id/ams`
+
+Returns the live AMS slot list for one specific printer. Used by Printer Detail to show that machine's current tray inventory.
+
+- `404` if printer does not exist
+- `[]` for non-Bambu printers or inactive printers
+- same slot object shape as `GET /api/printers/ams`
+
 ---
 
 ### `GET /api/printers/:id`
@@ -100,7 +108,7 @@ Returns `201` with the created printer object. Returns `409` if `name` already e
 
 ### `PUT /api/printers/:id`
 
-Partial update — only fields provided are changed (uses `COALESCE`). All fields from POST are accepted, plus `is_held` (`0` or `1`).
+Partial update, only fields provided are changed (uses `COALESCE`). All fields from POST are accepted, plus `is_held` (`0` or `1`) and `manual_hold` (`0` or `1`).
 
 Returns `404` if not found, `409` on name conflict.
 
@@ -114,7 +122,7 @@ Returns `404` if not found.
 
 ### `POST /api/printers/:id/set-ready`
 
-Releases the printer's hold (`is_held = 0`) and immediately dispatches the next eligible job to it. Called by the Fleet UI when an operator confirms a print is good.
+Releases the printer's hold (`is_held = 0`, `manual_hold = 0`) and immediately dispatches the next eligible job to it. Called by the Fleet UI when an operator confirms a print is good.
 
 Accepts an optional body:
 ```json
@@ -124,6 +132,41 @@ Accepts an optional body:
 If `confirmed_qty` is provided and differs from the `parts_per_plate` of the printer's most recent finished job, the delta is applied to the part's `completed_qty` (e.g. operator confirms 24 of 25 good → `completed_qty` decremented by 1). If the auto-credit had closed the part, it is reopened. Omitting the body leaves `completed_qty` unchanged.
 
 **OFFLINE-with-job exception:** if the printer's current status is `OFFLINE` and it has a `printing` job (no finished job), qty is not credited and the job is not marked finished. The printer is simply unheld and the job continues to its natural finish. This is the "Job OK" path from the Fleet UI — the operator is confirming the job is still running, not that it completed.
+
+Returns the updated printer object.
+
+### `POST /api/printers/:id/manual-hold`
+
+Places a printer on operator manual hold (`is_held = 1`, `manual_hold = 1`) so it is excluded from future queued dispatch. If the machine is currently printing, that active print continues normally and the hold applies to the next dispatch decision.
+
+Optional body:
+```json
+{ "note": "Reserve for 4-color flexy" }
+```
+
+Returns the updated printer object. Returns `409` for decommissioned printers.
+
+### `POST /api/printers/:id/release-hold`
+
+Clears manual hold (`is_held = 0`, `manual_hold = 0`) and triggers scheduler dispatch for that printer.
+
+Optional body:
+```json
+{ "note": "Manual job done" }
+```
+
+Returns the updated printer object. Returns `409` for decommissioned printers.
+
+### `POST /api/printers/:id/clear-stopped`
+
+Clears stopped-state hold (`is_held = 0`, `manual_hold = 0`) and triggers scheduler dispatch for that printer.
+
+If a lingering `uploading` or `printing` job exists on the printer during recovery, it is marked `cancelled` first so STOPPED recovery can fully return the machine to normal dispatch.
+
+Optional body:
+```json
+{ "note": "Recovered after manual check" }
+```
 
 Returns the updated printer object.
 
@@ -291,17 +334,157 @@ Returns `404` if the group doesn't exist. Returns `409` if it's still referenced
 
 ### `GET /api/projects`
 
-Returns all projects ordered by `created_at DESC`.
+Returns all projects ordered by `priority ASC, created_at ASC`.
+
+Each project includes `tags`:
+
+```json
+[
+  {
+    "id": 12,
+    "name": "Widget Batch",
+    "status": "active",
+    "tags": [
+      { "id": 2, "name": "rush" },
+      { "id": 5, "name": "yellow" }
+    ]
+  }
+]
+```
+
+Projects may also include size-family metadata used to group model variants in the UI:
+
+- `family_name` (string): canonical family name, for example `Chunky Jessie`
+- `size_label` (string): display size label, for example `100%` or `80%`
+- `size_rank` (integer): numeric sort value for size ordering, for example `100` and `80`
 
 ### `GET /api/projects/:id`
 
-Returns a single project. `404` if not found.
+Returns a single project with `tags`. `404` if not found.
 
 ### `POST /api/projects`
 
 Required: `name`. Optional: `description`.
 
 Returns `201` with created project (`status` defaults to `"draft"`).
+
+### `POST /api/projects/import-3mf`
+
+Uploads one or more pre-sliced Bambu/OrcaSlicer `.3mf` files, then creates one draft project with one Part per plate index and one or more G-code rows per Part.
+
+Request is `multipart/form-data`:
+- `file` (optional): single `.3mf` file
+- `files` (optional): multiple `.3mf` files
+- `project_name` (required): project name
+- `printer_model` (optional): model id from `printer_models`
+- `printer_models` (optional): JSON array string or comma-separated list of model ids (for example `"[\"x1c\",\"p1s\"]"` or `"x1c,p1s"`)
+- `file_printer_models` (optional): JSON array with one model id per uploaded file index (use empty string to fall back to global/suffix resolution for that file)
+
+At least one of `file` or `files` is required.
+
+Resolution order:
+- If `file_printer_models[i]` is provided for a file, that file imports for that single model.
+- Else if `printer_models` is provided, each file creates one G-code row per listed model on each plate.
+- Else if `printer_model` is provided, each file creates one G-code row per plate for that model.
+- Else the server auto-detects one model per file from each filename suffix.
+
+If `printer_model` is omitted, the server auto-detects it from the filename suffix:
+- accepted patterns: `*_x1c.3mf`, `*_x1c.gcode.3mf`, `*_x1c.bgcode.3mf`
+- detection reads the final `_model` token before `.3mf` (after optional `.gcode` / `.bgcode`)
+
+Optional size suffix support:
+- If filenames follow `*_<size>_<model>.gcode.3mf` (for example `chunky_jessie_100_x1c.gcode.3mf`), import infers project size metadata from `<size>`.
+- Multi-file imports must use one consistent size suffix per request.
+
+Every resolved model id must exist in `printer_models` and must use the `bambu` connector.
+
+When multiple files are uploaded, plates are grouped by `plate_index`, so `Plate 1` appears once in the project and contains one G-code row per matching uploaded source/model.
+
+Success response:
+```json
+{
+  "project": {
+    "id": 12,
+    "name": "Widget Batch",
+    "status": "draft"
+  },
+  "plates": [
+    {
+      "source_files": ["widget_x1c.gcode.3mf", "widget_p1s.gcode.3mf"],
+      "plate_index": 2,
+      "part_id": 45,
+      "gcode_id": 81,
+      "gcodes": [
+        { "printer_model": "x1c", "gcode_id": 81, "source_file": "widget_x1c.gcode.3mf" },
+        { "printer_model": "p1s", "gcode_id": 82, "source_file": "widget_p1s.gcode.3mf" }
+      ],
+      "parts_per_plate": 5,
+      "est_print_secs": 2920,
+      "material_grams": 19.48,
+      "required_material": "PLA",
+      "required_color": "FFF144"
+    }
+  ]
+}
+```
+
+Validation failures return `400`:
+- missing file / invalid extension
+- missing `project_name`
+- missing model resolution for a file (`file_printer_models`/`printer_model`/`printer_models` omitted and no detectable filename suffix)
+- `file_printer_models` length does not match uploaded file count
+- same `plate_index` has mismatched `parts_per_plate` across uploaded files
+- unknown model id
+- model exists but is not a Bambu connector
+- unsliced 3MF (no `Metadata/plate_N.gcode`/`.bgcode` entries)
+
+### `POST /api/projects/:id/reimport-3mf`
+
+Re-imports one or more sliced Bambu/OrcaSlicer `.3mf` files into an existing project, updating only matching plates and adding new split plates as needed.
+
+Request is `multipart/form-data`:
+- `file` (optional): single `.3mf` file
+- `files` (optional): multiple `.3mf` files
+- `printer_model` / `printer_models` / `file_printer_models`: same model resolution behavior as `POST /api/projects/import-3mf`
+- `obsolete_action` (optional): `keep` (default), `archive`, or `remove`
+
+Optional size guard:
+- If uploaded filenames use `*_<size>_<model>.gcode.3mf`, re-import validates that `<size>` matches the target project's size variant.
+- Mismatch returns `409` to prevent cross-size updates (for example importing `100%` files into an `80%` project).
+
+Matching behavior:
+- Existing parts are matched by `gcodes.plate_no` first.
+- If no `plate_no` match exists, fallback is part name prefix `Plate N`.
+- Matched parts keep their IDs/history and have plate metadata + per-model G-code rows updated in place.
+- Imported plate groups with no match create new parts.
+
+`obsolete_action` behavior for existing parts not present in the new import:
+- `keep`: leave untouched (history and queue state unchanged)
+- `archive`: set part `status='closed'` and `target_qty=completed_qty` (history kept, no further dispatch)
+- `remove`: delete the part and its jobs/gcodes (blocked with `409` if an active uploading/printing job exists)
+
+Success response (`200`):
+```json
+{
+  "project": { "id": 5, "name": "Chunky Jessie", "status": "active" },
+  "summary": {
+    "updated_parts": 8,
+    "created_parts": 2,
+    "updated_gcodes": 16,
+    "inserted_gcodes": 4,
+    "obsolete_action": "archive",
+    "untouched_parts": 3
+  },
+  "plates": [
+    {
+      "plate_index": 6,
+      "part_id": 28,
+      "source_files": ["Chunky_Jessie_x1c.gcode.3mf"],
+      "models": ["x1c"]
+    }
+  ]
+}
+```
 
 ### `PUT /api/projects/:id`
 
@@ -321,7 +504,50 @@ Sets a project-wide default `allowed_groups`, applied to every G-code in the pro
 
 **Body:** `{ "allowed_groups": ["Rack A", "Rack B"] }`. An empty array (or omitted) clears the project default back to unrestricted.
 
+### `PUT /api/projects/:id/tags`
+
+Sets the exact tag set for a project.
+
+**Body:** `{ "tag_ids": [2, 5] }`
+
+- `tag_ids` must be an array of positive integer tag IDs.
+- Empty array clears all tags.
+- Returns the updated project object including `tags`.
+- Returns `400` if any tag ID does not exist.
+
 ### `DELETE /api/projects/:id`
+
+---
+
+## Project Tags
+
+### `GET /api/project-tags`
+
+Returns all tags, ordered by name.
+
+```json
+[
+  { "id": 2, "name": "rush", "created_at": 1783800000000 },
+  { "id": 5, "name": "yellow", "created_at": 1783800500000 }
+]
+```
+
+### `POST /api/project-tags`
+
+Creates a tag.
+
+**Body:** `{ "name": "rush" }`
+
+- `name` is required and trimmed.
+- Returns `201` with the created tag.
+- Returns `409` if the tag name already exists.
+
+### `DELETE /api/project-tags/:id`
+
+Deletes an unused tag.
+
+- Returns `404` if the tag does not exist.
+- Returns `409` if the tag is still assigned to one or more projects.
 
 ---
 
@@ -351,6 +577,8 @@ Diagnostic for the "Why isn't this printing?" button on the Projects page. Mirro
 
 - `reasons` — populated when `dispatchable` is `false`: global blockers (project not active, part complete, no G-code, remaining qty already covered by in-progress jobs) followed by per-G-code availability problems (no printers of that model, group/material/color mismatch, all matching printers busy or held).
 - `notes` — populated when `dispatchable` is `true`: advisory per-G-code items (e.g. one G-code can dispatch but another has no ready printers).
+
+Color matching note: for Bambu printers, required color can match either the printer's `loaded_color` field or any currently loaded AMS/external tray color (mapped through Filament Library hex colors). Brand-prefixed labels such as `Sunlu White` or `Bambu Black` are normalized to the canonical Filament Library color name before comparison, so a physical spool can still satisfy a queued `White` or `Black` requirement.
 
 ### `POST /api/parts`
 
@@ -443,6 +671,8 @@ Upload a G-code file and create a DB record. `Content-Type: multipart/form-data`
 - `ams_slot` (optional) — Bambu only
 - `allowed_groups` (optional): JSON array string e.g. `'["Rack A","Rack B"]'`; restricts dispatch to printers in one of these groups. Omitted or empty means unrestricted at the G-code level (falls back to the project's `allowed_groups`, if any; see `PUT /api/projects/:id/groups`)
 - `required_material` / `required_color` (optional): overrides the project's defaults for this G-code specifically
+
+For single-color Bambu dispatch, `required_color` can be satisfied by either `loaded_color` or any currently loaded AMS tray color that maps to that color name in Filament Library (by `hex_color`).
 
 Returns `201` with created G-code record. Returns `409` if a G-code for this `(part_id, printer_model)` combination already exists.
 
@@ -605,6 +835,11 @@ Single endpoint that returns all data required by the TV dashboard in one call. 
 - `elapsed_secs` — total wall-clock print time in seconds: sum of `finished_at − started_at` for all `finished` jobs in the project, plus `now − started_at` for any currently `printing` job.
 - `material_used_grams` — total material consumed in grams: sum of `gcode.material_grams / gcode.parts_per_plate * job.parts_per_plate` across all `finished` jobs that have a linked gcode with `material_grams` set. `null` if no jobs have gcode material data.
 - `model_breakdown` — array of per-printer-model summaries for all finished jobs: `{ printer_model, jobs_count, parts_printed, material_grams, elapsed_secs }`, ordered by `parts_printed DESC`.
+
+Each part row in `active_projects[].parts` also includes dashboard color-target helpers:
+
+- `required_colors_json` — JSON array string of distinct non-empty `gcodes.required_color` values for that part, ordered alphabetically (for example `"[\"FF0000\",\"White\"]"`).
+- `effective_required_color` — first non-empty `gcodes.required_color` for the part, or the parent project's `required_color` when no gcode-level color override exists.
 
 `recent_activity` is the 12 most recent `finished` or `failed` jobs, each with `part_name` and `printer_name` joined in. (Retained in the payload for compatibility; the dashboard UI no longer renders this list — see [web-app.md](web-app.md).)
 

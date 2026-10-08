@@ -20,13 +20,13 @@ const notifications  = require('./notifications');
 const events         = require('./events');
 const backup         = require('./backup');
 
-const printersRouter     = require('./routes/printers')(db);
 const jobsRouter         = require('./routes/jobs')(db);
 const backupRouter       = require('./routes/backup')(db);
 const dashboardRouter    = require('./routes/dashboard')(db);
 const settingsRouter     = require('./routes/settings')(db);
 const modelsRouter       = require('./routes/models')(db);
 const groupsRouter       = require('./routes/groups')(db);
+const projectTagsRouter  = require('./routes/project-tags')(db);
 const filamentsRouter    = require('./routes/filaments')(db);
 const printerJobsRouter  = require('./routes/printer-jobs')(db);
 
@@ -36,7 +36,6 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
 // API routes
-app.use('/api/printers',        printersRouter);
 app.use('/api/printers/:id/jobs', printerJobsRouter);
 app.use('/api/jobs',            jobsRouter);
 app.use('/api/backup',          backupRouter);
@@ -44,6 +43,7 @@ app.use('/api/dashboard',       dashboardRouter);
 app.use('/api/settings',        settingsRouter);
 app.use('/api/models',          modelsRouter);
 app.use('/api/groups',          groupsRouter);
+app.use('/api/project-tags',    projectTagsRouter);
 app.use('/api/filaments',       filamentsRouter);
 
 // Health check
@@ -85,6 +85,8 @@ const server = app.listen(PORT, () => {
 
   const poller    = new PrinterPoller(db);
   const scheduler = new JobScheduler(db, poller);
+  const printersRouter = require('./routes/printers')(db, scheduler);
+  app.use('/api/printers', printersRouter);
 
   // Mount projects, parts, and gcodes routers here so they have access to the
   // scheduler: projects for complete/reactivate, parts for the sweep after adding a
@@ -123,7 +125,7 @@ const server = app.listen(PORT, () => {
       return res.status(400).json({ error: 'ids array required' });
     }
     const placeholders = ids.map(() => '?').join(',');
-    db.prepare(`UPDATE printers SET is_held = 0 WHERE id IN (${placeholders})`).run(...ids);
+    db.prepare(`UPDATE printers SET is_held = 0, manual_hold = 0 WHERE id IN (${placeholders})`).run(...ids);
     const printers = db.prepare(`SELECT * FROM printers WHERE id IN (${placeholders}) AND is_active = 1`).all(...ids);
     const batchSetting = db.prepare("SELECT value FROM settings WHERE key = 'dispatch_batch_size'").get();
     const batchSize = batchSetting ? parseInt(batchSetting.value, 10) : 10;
@@ -141,7 +143,7 @@ const server = app.listen(PORT, () => {
     if (!printer) return res.status(404).json({ error: 'Printer not found' });
     db.prepare(`
       UPDATE printers
-      SET is_active = 1, is_held = 0, decommissioned_at = NULL, decommission_note = NULL
+      SET is_active = 1, is_held = 0, manual_hold = 0, decommissioned_at = NULL, decommission_note = NULL
       WHERE id = ?
     `).run(printer.id);
     events.insert(printer.id, 'recommission', req.body?.note ?? null);
@@ -335,7 +337,7 @@ const server = app.listen(PORT, () => {
       }
     }
 
-    db.prepare('UPDATE printers SET is_held = 0 WHERE id = ?').run(printer.id);
+    db.prepare('UPDATE printers SET is_held = 0, manual_hold = 0 WHERE id = ?').run(printer.id);
     const updated = db.prepare('SELECT * FROM printers WHERE id = ?').get(printer.id);
     console.log(`[server] ${printer.name} set ready by operator — dispatching...`);
     scheduler.scheduleForPrinter(updated);

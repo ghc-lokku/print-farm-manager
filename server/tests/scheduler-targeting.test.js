@@ -15,7 +15,9 @@ const mockDriver = {
   uploadAndPrint: jest.fn(),
   checkIfPrinting: jest.fn(),
 };
+const mockGetAmsSlots = jest.fn();
 jest.mock('../drivers', () => ({ getDriver: jest.fn(() => mockDriver) }));
+jest.mock('../drivers/bambu', () => ({ getAmsSlots: (...args) => mockGetAmsSlots(...args) }));
 jest.mock('../notifications', () => ({ add: jest.fn() }));
 
 const JobScheduler = require('../scheduler');
@@ -24,18 +26,23 @@ const GCODE_DIR = path.join(__dirname, '..', 'gcode');
 
 // A real gcode file on disk — required by the scheduler before it calls the driver
 let gcodeFilename;
+let gcodeFilenameAlt;
 beforeAll(() => {
   if (!fs.existsSync(GCODE_DIR)) fs.mkdirSync(GCODE_DIR, { recursive: true });
   gcodeFilename = `targeting_test_${Date.now()}.bgcode`;
+  gcodeFilenameAlt = `targeting_test_alt_${Date.now()}.bgcode`;
   fs.writeFileSync(path.join(GCODE_DIR, gcodeFilename), 'G28');
+  fs.writeFileSync(path.join(GCODE_DIR, gcodeFilenameAlt), 'G28');
 });
 afterAll(() => {
   try { fs.unlinkSync(path.join(GCODE_DIR, gcodeFilename)); } catch (_) {}
+  try { fs.unlinkSync(path.join(GCODE_DIR, gcodeFilenameAlt)); } catch (_) {}
 });
 
 beforeEach(() => {
   mockDriver.uploadAndPrint.mockResolvedValue(undefined);
   mockDriver.checkIfPrinting.mockResolvedValue(false);
+  mockGetAmsSlots.mockReturnValue(null);
   jest.clearAllMocks();
 });
 
@@ -53,7 +60,8 @@ beforeEach(() => {
  */
 function makeDb({ printerGroup = null, printerMaterial = null, printerColor = null,
                    gcodeGroups = null, gcodeMaterial = null, gcodeColor = null,
-                   projectGroups = null } = {}) {
+                   projectGroups = null, printerType = 'prusa', filamentColors = [],
+                   gcodeAmsSlot = null } = {}) {
   const db = new Database(':memory:');
   db.exec(`
     CREATE TABLE printers (
@@ -84,6 +92,7 @@ function makeDb({ printerGroup = null, printerMaterial = null, printerColor = nu
       filename TEXT NOT NULL, filepath TEXT NOT NULL,
       parts_per_plate INTEGER NOT NULL, ams_slot INTEGER,
       allowed_groups TEXT, required_material TEXT, required_color TEXT,
+      plate_no INTEGER,
       created_at INTEGER NOT NULL
     );
     CREATE TABLE jobs (
@@ -94,21 +103,44 @@ function makeDb({ printerGroup = null, printerMaterial = null, printerColor = nu
       started_at INTEGER, finished_at INTEGER, created_at INTEGER NOT NULL
     );
     CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE filament_types (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE
+    );
+    CREATE TABLE filament_colors (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      hex_color TEXT,
+      UNIQUE(type_id, name)
+    );
     INSERT INTO settings VALUES ('dispatch_batch_size', '10');
   `);
 
   const now = Date.now();
   db.prepare(`INSERT INTO printers (name, ip, api_key, model, type, group_name, loaded_material, loaded_color, status, is_held, is_active, created_at)
-              VALUES ('P1', '192.168.1.1', 'key', 'mk4s', 'prusa', ?, ?, ?, 'IDLE', 0, 1, ?)`)
-    .run(printerGroup, printerMaterial, printerColor, now);
+              VALUES ('P1', '192.168.1.1', 'key', 'mk4s', ?, ?, ?, ?, 'IDLE', 0, 1, ?)`)
+    .run(printerType, printerGroup, printerMaterial, printerColor, now);
   db.prepare(`INSERT INTO projects (name, status, priority, allowed_groups, created_at, updated_at) VALUES ('Proj', 'active', 0, ?, ?, ?)`)
     .run(projectGroups, now, now);
   db.prepare(`INSERT INTO parts (project_id, name, target_qty, completed_qty, status, sort_order, created_at, updated_at)
               VALUES (1, 'Part A', 10, 0, 'open', 0, ?, ?)`)
     .run(now, now);
-  db.prepare(`INSERT INTO gcodes (part_id, printer_model, filename, filepath, parts_per_plate, allowed_groups, required_material, required_color, created_at)
-              VALUES (1, 'mk4s', ?, ?, 2, ?, ?, ?, ?)`)
-    .run(gcodeFilename, gcodeFilename, gcodeGroups, gcodeMaterial, gcodeColor, now);
+  db.prepare(`INSERT INTO gcodes (part_id, printer_model, filename, filepath, parts_per_plate, ams_slot, allowed_groups, required_material, required_color, created_at)
+              VALUES (1, 'mk4s', ?, ?, 2, ?, ?, ?, ?, ?)`)
+    .run(gcodeFilename, gcodeFilename, gcodeAmsSlot, gcodeGroups, gcodeMaterial, gcodeColor, now);
+
+  const typeIdByName = new Map();
+  const insertType = db.prepare('INSERT OR IGNORE INTO filament_types (name) VALUES (?)');
+  const getType = db.prepare('SELECT id FROM filament_types WHERE name = ?');
+  const insertColor = db.prepare('INSERT INTO filament_colors (type_id, name, hex_color) VALUES (?, ?, ?)');
+  for (const c of filamentColors) {
+    insertType.run(c.type);
+    if (!typeIdByName.has(c.type)) {
+      typeIdByName.set(c.type, getType.get(c.type).id);
+    }
+    insertColor.run(typeIdByName.get(c.type), c.name, c.hex);
+  }
 
   return db;
 }
@@ -207,8 +239,34 @@ describe('scheduler — color filtering', () => {
     expect(mockDriver.uploadAndPrint).toHaveBeenCalled();
   });
 
+  test('dispatches when loaded_color has a brand prefix but matches the canonical filament color', async () => {
+    const db = makeDb({
+      printerColor: 'Sunlu White',
+      gcodeColor: 'White',
+      filamentColors: [{ type: 'PLA', name: 'White', hex: '#FFFFFF' }],
+    });
+    const scheduler = new JobScheduler(db, { on: () => {} });
+    const jobId = await scheduler._dispatchToPrinter({ ...printer, loaded_color: 'Sunlu White' });
+    expect(jobId).not.toBeNull();
+    expect(mockDriver.uploadAndPrint).toHaveBeenCalled();
+  });
+
   test('skips dispatch when printer color does not match required_color', async () => {
     const db = makeDb({ printerColor: 'White', gcodeColor: 'Black' });
+    const scheduler = new JobScheduler(db, { on: () => {} });
+    const jobId = await scheduler._dispatchToPrinter({ ...printer, loaded_color: 'White' });
+    expect(jobId).toBeNull();
+    expect(mockDriver.uploadAndPrint).not.toHaveBeenCalled();
+  });
+
+  test('uses the newest gcode row when duplicate model rows exist', async () => {
+    const db = makeDb({ printerColor: 'White', gcodeColor: null });
+    const now = Date.now();
+    db.prepare(`
+      INSERT INTO gcodes (part_id, printer_model, filename, filepath, parts_per_plate, ams_slot, allowed_groups, required_material, required_color, created_at)
+      VALUES (1, 'mk4s', ?, ?, 2, NULL, NULL, NULL, 'Black', ?)
+    `).run(gcodeFilenameAlt, gcodeFilenameAlt, now + 1);
+
     const scheduler = new JobScheduler(db, { on: () => {} });
     const jobId = await scheduler._dispatchToPrinter({ ...printer, loaded_color: 'White' });
     expect(jobId).toBeNull();
@@ -221,6 +279,192 @@ describe('scheduler — color filtering', () => {
     const jobId = await scheduler._dispatchToPrinter({ ...printer, loaded_color: null });
     expect(jobId).toBeNull();
     expect(mockDriver.uploadAndPrint).not.toHaveBeenCalled();
+  });
+
+  test('dispatches Bambu job when required_color matches an AMS slot color', async () => {
+    const db = makeDb({
+      printerType: 'bambu',
+      printerColor: null,
+      gcodeColor: 'Black',
+      filamentColors: [{ type: 'PLA', name: 'Black', hex: '#000000' }],
+    });
+    mockGetAmsSlots.mockReturnValue([{ slot: 1, type: 'PLA', color: '000000FF' }]);
+
+    const scheduler = new JobScheduler(db, { on: () => {} });
+    const jobId = await scheduler._dispatchToPrinter({ ...printer, type: 'bambu', loaded_color: null });
+    expect(jobId).not.toBeNull();
+    expect(mockDriver.uploadAndPrint).toHaveBeenCalled();
+  });
+
+  test('skips Bambu job when AMS has no slot color matching required_color', async () => {
+    const db = makeDb({
+      printerType: 'bambu',
+      printerColor: null,
+      gcodeColor: 'Black',
+      filamentColors: [{ type: 'PLA', name: 'Green', hex: '#00FF00' }],
+    });
+    mockGetAmsSlots.mockReturnValue([{ slot: 1, type: 'PLA', color: '00FF00FF' }]);
+
+    const scheduler = new JobScheduler(db, { on: () => {} });
+    const jobId = await scheduler._dispatchToPrinter({ ...printer, type: 'bambu', loaded_color: null });
+    expect(jobId).toBeNull();
+    expect(mockDriver.uploadAndPrint).not.toHaveBeenCalled();
+  });
+
+  test('uses live color-matched AMS slot over stale gcode ams_slot', async () => {
+    const db = makeDb({
+      printerType: 'bambu',
+      printerColor: null,
+      gcodeColor: 'Black',
+      gcodeAmsSlot: 4,
+      filamentColors: [{ type: 'PLA', name: 'Black', hex: '#000000' }],
+    });
+    mockGetAmsSlots.mockReturnValue([{ slot: 0, type: 'PLA', color: '000000FF' }]);
+
+    const scheduler = new JobScheduler(db, { on: () => {} });
+    const jobId = await scheduler._dispatchToPrinter({ ...printer, type: 'bambu', loaded_color: null });
+    expect(jobId).not.toBeNull();
+    expect(mockDriver.uploadAndPrint).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'bambu' }),
+      expect.any(String),
+      expect.any(String),
+      expect.objectContaining({ amsSlot: 0, amsSlots: [0] })
+    );
+  });
+
+  test('dispatches Bambu job when required_color contains both Black and White and printer has both loaded', async () => {
+    const db = makeDb({
+      printerType: 'bambu',
+      printerColor: null,
+      gcodeColor: 'Black, White',
+      filamentColors: [
+        { type: 'PLA', name: 'Black', hex: '#000000' },
+        { type: 'PLA', name: 'White', hex: '#FFFFFF' },
+      ],
+    });
+    mockGetAmsSlots.mockReturnValue([
+      { slot: 2, type: 'PLA', color: '000000FF' },
+      { slot: 3, type: 'PLA', color: 'FFFFFFFF' },
+    ]);
+
+    const scheduler = new JobScheduler(db, { on: () => {} });
+    const jobId = await scheduler._dispatchToPrinter({ ...printer, type: 'bambu', loaded_color: null });
+    expect(jobId).not.toBeNull();
+    expect(mockDriver.uploadAndPrint).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'bambu' }),
+      expect.any(String),
+      expect.any(String),
+      expect.objectContaining({ amsSlot: 2, amsSlots: [2, 3] })
+    );
+  });
+
+  test('skips Bambu job when required_color contains more colors than the printer currently has loaded', async () => {
+    const db = makeDb({
+      printerType: 'bambu',
+      printerColor: null,
+      gcodeColor: 'Black, White',
+      filamentColors: [
+        { type: 'PLA', name: 'Black', hex: '#000000' },
+        { type: 'PLA', name: 'White', hex: '#FFFFFF' },
+      ],
+    });
+    mockGetAmsSlots.mockReturnValue([
+      { slot: 2, type: 'PLA', color: '000000FF' },
+    ]);
+
+    const scheduler = new JobScheduler(db, { on: () => {} });
+    const jobId = await scheduler._dispatchToPrinter({ ...printer, type: 'bambu', loaded_color: null });
+    expect(jobId).toBeNull();
+    expect(mockDriver.uploadAndPrint).not.toHaveBeenCalled();
+  });
+
+  test('dispatches to an alternate Bambu model row when the exact printer model is unavailable', async () => {
+    const db = makeDb({
+      printerType: 'bambu',
+      printerColor: null,
+      gcodeColor: 'Black',
+      filamentColors: [{ type: 'PLA', name: 'Black', hex: '#000000' }],
+    });
+    mockGetAmsSlots.mockReturnValue([{ slot: 1, type: 'PLA', color: '000000FF' }]);
+
+    const scheduler = new JobScheduler(db, { on: () => {} });
+    db.prepare('UPDATE gcodes SET printer_model = ? WHERE id = 1').run('p1s');
+
+    const jobId = await scheduler._dispatchToPrinter({
+      ...printer,
+      type: 'bambu',
+      model: 'x1c',
+      loaded_material: 'PLA',
+      loaded_color: null,
+      group_name: null,
+    });
+
+    expect(jobId).not.toBeNull();
+    expect(mockDriver.uploadAndPrint).toHaveBeenCalled();
+  });
+
+  test('skips Bambu job when required PLA color exists only in TPU tray telemetry', async () => {
+    const db = makeDb({
+      printerType: 'bambu',
+      printerMaterial: 'PLA', // stale manual value should not override live tray type
+      printerColor: 'Black',
+      gcodeMaterial: 'PLA',
+      gcodeColor: 'Black',
+      filamentColors: [
+        { type: 'PLA', name: 'Black', hex: '#000000' },
+        { type: 'TPU', name: 'Black', hex: '#000000' },
+      ],
+    });
+    mockGetAmsSlots.mockReturnValue([
+      { slot: -1, type: 'TPU', color: '000000FF' },
+    ]);
+
+    const scheduler = new JobScheduler(db, { on: () => {} });
+    const jobId = await scheduler._dispatchToPrinter({
+      ...printer,
+      type: 'bambu',
+      loaded_material: 'PLA',
+      loaded_color: 'Black',
+    });
+
+    expect(jobId).toBeNull();
+    expect(mockDriver.uploadAndPrint).not.toHaveBeenCalled();
+  });
+
+  test('prefers exact Bambu model row when both exact and alternate rows exist', async () => {
+    const db = makeDb({
+      printerType: 'bambu',
+      printerColor: null,
+      gcodeColor: 'Black',
+      filamentColors: [{ type: 'PLA', name: 'Black', hex: '#000000' }],
+    });
+    mockGetAmsSlots.mockReturnValue([{ slot: 1, type: 'PLA', color: '000000FF' }]);
+
+    // Base row becomes alternate model, then add an exact-model row.
+    db.prepare('UPDATE gcodes SET printer_model = ? WHERE id = 1').run('p2s');
+    db.prepare(`
+      INSERT INTO gcodes (part_id, printer_model, filename, filepath, parts_per_plate, ams_slot, allowed_groups, required_material, required_color, created_at)
+      VALUES (1, 'x1c', ?, ?, 2, NULL, NULL, 'PLA', 'Black', ?)
+    `).run(gcodeFilenameAlt, gcodeFilenameAlt, Date.now());
+
+    const scheduler = new JobScheduler(db, { on: () => {} });
+    const jobId = await scheduler._dispatchToPrinter({
+      ...printer,
+      type: 'bambu',
+      model: 'x1c',
+      loaded_material: 'PLA',
+      loaded_color: null,
+      group_name: null,
+    });
+
+    expect(jobId).not.toBeNull();
+    const row = db.prepare(`
+      SELECT g.printer_model AS gcode_model
+      FROM jobs j
+      JOIN gcodes g ON g.id = j.gcode_id
+      WHERE j.id = ?
+    `).get(jobId);
+    expect(row.gcode_model).toBe('x1c');
   });
 });
 

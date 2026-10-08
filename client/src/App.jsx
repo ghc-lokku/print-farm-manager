@@ -8,6 +8,7 @@ import Projects from './pages/Projects';
 import Jobs from './pages/Jobs';
 import Settings from './pages/Settings';
 import Decommissioned from './pages/Decommissioned';
+import ImportThreeMf from './pages/ImportThreeMf';
 
 const NAV_ITEMS = [
   { to: '/',               label: 'Dashboard' },
@@ -16,6 +17,7 @@ const NAV_ITEMS = [
   { to: '/projects',       label: 'Projects' },
   { to: '/jobs',           label: 'Jobs' },
   { to: '/decommissioned', label: 'Decommissioned' },
+  { to: '/import-3mf',     label: 'Import 3MF' },
   { to: '/settings',       label: 'Settings' },
 ];
 
@@ -111,6 +113,7 @@ export default function App() {
             <Route path="/projects"        element={<Projects />} />
             <Route path="/jobs"            element={<Jobs />} />
             <Route path="/decommissioned"  element={<Decommissioned />} />
+            <Route path="/import-3mf"      element={<ImportThreeMf />} />
             <Route path="/settings"        element={<Settings />} />
           </Routes>
         </main>

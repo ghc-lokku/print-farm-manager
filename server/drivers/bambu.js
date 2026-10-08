@@ -26,6 +26,8 @@
 const mqtt     = require('mqtt');
 const ftp      = require('basic-ftp');
 const path     = require('path');
+const { execFile } = require('child_process');
+const { openThreeMf, detectProjectMetadata, parsePlateFilaments } = require('../parse-3mf');
 
 // Map of printer.id → { client, latestPrint, connected }
 const connections = new Map();
@@ -107,6 +109,101 @@ function dropConnection(printerId) {
     try { conn.client?.end(true); } catch (_) {}
     connections.delete(printerId);
   }
+}
+
+function isFtpsSessionReuseError(err) {
+  const msg = String(err?.message || err || '').toLowerCase();
+  return msg.includes('session reuse required') ||
+         msg.includes('ssl connection failed: session reuse required') ||
+         msg.includes('server sent fin packet unexpectedly') ||
+         msg.includes('premature close');
+}
+
+function uploadViaCurlFtps(printer, localPath, remoteFilename) {
+  return new Promise((resolve, reject) => {
+    const encodedFilename = encodeURIComponent(remoteFilename);
+    const url = `ftps://${printer.ip}:990/${encodedFilename}`;
+    const args = [
+      '--silent', '--show-error', '--fail',
+      '--insecure',
+      '--ftp-ssl-reqd',
+      '--tlsv1.2',
+      '--disable-epsv',
+      '--user', `bblp:${printer.api_key}`,
+      '--upload-file', localPath,
+      url,
+    ];
+
+    execFile('curl', args, { timeout: 300000, windowsHide: true }, (err, _stdout, stderr) => {
+      if (!err) return resolve();
+
+      if (err.code === 'ENOENT') {
+        return reject(Object.assign(
+          new Error('FTPS fallback requires curl, but curl is not installed in this runtime.'),
+          { code: 'BAMBU_FTPS_SESSION_REUSE' }
+        ));
+      }
+
+      const details = (stderr || '').trim();
+      return reject(Object.assign(
+        new Error(details ? `curl FTPS upload failed: ${details}` : `curl FTPS upload failed (${err.message})`),
+        { code: 'BAMBU_FTPS_SESSION_REUSE' }
+      ));
+    });
+  });
+}
+
+// ─── 3MF parsing ────────────────────────────────────────────────────────────
+// openThreeMf / detectProjectMetadata / parsePlateFilaments are in ../parse-3mf.
+
+// Builds ams_mapping aligned to the .3mf's real filament indices. Bambu indexes the
+// mapping by each filament's position in the project (0-based id - 1) and sizes it to the
+// project's filament count, so a file that uses only filaments 5 and 6 of a 6-filament
+// project needs [-1, -1, -1, -1, slotA, slotB], not [slotA, slotB]. Each used filament's
+// color is matched to a loaded AMS tray by hex; if any color cannot be matched, the
+// scheduler's already color-matched trays (requestedAmsSlots, in required-color order)
+// are aligned to the used filament ids in ascending order. Returns null when the plate
+// cannot be parsed so the caller can fall back to the padded single-list format.
+function buildAmsMappingFromThreeMf(threeMfPath, plateIndex, printer, requestedAmsSlots) {
+  const plate = parsePlateFilaments(threeMfPath, plateIndex);
+  if (!plate || plate.filaments.length === 0) return null;
+
+  const maxId = Math.max(...plate.filaments.map((f) => f.id));
+  const length = Math.max(plate.filamentCount || 0, maxId);
+  if (!Number.isFinite(length) || length < 1 || length > 64) return null;
+
+  const slots = getAmsSlots(printer) || [];
+
+  // Primary: match each used filament's color to a currently loaded AMS tray by hex.
+  const mapping = new Array(length).fill(-1);
+  const usedTraySlots = new Set();
+  let allMatched = true;
+  for (const fil of plate.filaments) {
+    if (!Number.isFinite(fil.id) || fil.id < 1 || fil.id > length) { allMatched = false; break; }
+    const tray = fil.hex ? slots.find((s) => {
+      if (usedTraySlots.has(s.slot)) return false;
+      const sHex = typeof s.color === 'string' ? s.color.slice(0, 6).toUpperCase() : null;
+      return sHex === fil.hex;
+    }) : null;
+    if (!tray) { allMatched = false; break; }
+    mapping[fil.id - 1] = tray.slot;
+    usedTraySlots.add(tray.slot);
+  }
+  if (allMatched) return mapping;
+
+  // Fallback: align the scheduler's color-matched trays to the used filament ids.
+  if (Array.isArray(requestedAmsSlots) && requestedAmsSlots.length === plate.filaments.length) {
+    const sorted = [...plate.filaments].sort((a, b) => a.id - b.id);
+    const aligned = new Array(length).fill(-1);
+    for (let i = 0; i < sorted.length; i++) {
+      const id = sorted[i].id;
+      if (!Number.isFinite(id) || id < 1 || id > length) return null;
+      aligned[id - 1] = requestedAmsSlots[i];
+    }
+    return aligned;
+  }
+
+  return null;
 }
 
 // ─── Canonical state mapping ──────────────────────────────────────────────────
@@ -200,10 +297,11 @@ async function getStatus(printer) {
 // ─── Upload & Print ───────────────────────────────────────────────────────────
 
 // Returns the current AMS slot list from the cached MQTT state, or null if not connected.
-// Each slot: { slot, type, color }
+// Each slot: { slot, type, color, brand }
 //   slot  — compound id: (ams_unit * 4) + tray_id, or -1 for external spool
 //   type  — filament type string e.g. 'PLA', or '' if unknown
 //   color — RRGGBBAA hex string, or null
+//   brand — vendor/brand string when reported by firmware, or ''
 // Empty trays (no tray_type field) are omitted. External spool is always included.
 function getAmsSlots(printer) {
   const conn = connections.get(printer.id);
@@ -211,28 +309,103 @@ function getAmsSlots(printer) {
 
   const slots = [];
 
-  const amsUnits = conn.latestPrint.ams?.ams || [];
+  const rawAms = conn.latestPrint.ams;
+  let amsUnits = [];
+
+  // Classic AMS payload shape: { ams: { ams: [{ id, tray: [...] }, ...] } }
+  if (Array.isArray(rawAms?.ams)) {
+    amsUnits = rawAms.ams.map((unit, idx) => ({
+      id: unit?.id,
+      trays: Array.isArray(unit?.tray) ? unit.tray : [],
+      idx,
+    }));
+  }
+
+  // AMS Lite payload shape: { ams: { tray: [...] } }
+  if (amsUnits.length === 0 && Array.isArray(rawAms?.tray)) {
+    amsUnits = [{ id: 0, trays: rawAms.tray, idx: 0 }];
+  }
+
+  // Some firmwares expose ams as a direct array. It can be either a unit list
+  // or a direct tray list.
+  if (amsUnits.length === 0 && Array.isArray(rawAms)) {
+    const directTrayList = rawAms.every((item) => item && !Array.isArray(item?.tray) && ('tray_type' in item || 'tray_color' in item));
+    if (directTrayList) {
+      amsUnits = [{ id: 0, trays: rawAms, idx: 0 }];
+    } else {
+      amsUnits = rawAms.map((unit, idx) => ({
+        id: unit?.id,
+        trays: Array.isArray(unit?.tray) ? unit.tray : [],
+        idx,
+      }));
+    }
+  }
+
+  // Last-resort AMS Lite shape: top-level tray list.
+  if (amsUnits.length === 0 && Array.isArray(conn.latestPrint.tray)) {
+    amsUnits = [{ id: 0, trays: conn.latestPrint.tray, idx: 0 }];
+  }
+
+  const rawAmsIds = amsUnits
+    .map((u) => parseInt(u?.id, 10))
+    .filter(Number.isFinite);
+  const amsIdsAreOneBased = rawAmsIds.length > 0 && !rawAmsIds.includes(0);
+  const rawTrayIds = amsUnits
+    .flatMap((unit) => (unit.trays || []).map((t) => parseInt(t?.id, 10)))
+    .filter(Number.isFinite);
+  const trayIdsAreOneBased = rawTrayIds.length > 0 && !rawTrayIds.includes(0);
+
   for (const unit of amsUnits) {
-    const amsId = parseInt(unit.id, 10);
-    for (const tray of unit.tray || []) {
+    const rawAmsId = parseInt(unit.id, 10);
+    const amsIndex = Number.isFinite(rawAmsId)
+      ? (amsIdsAreOneBased ? rawAmsId - 1 : rawAmsId)
+      : unit.idx;
+
+    const trays = unit.trays || [];
+    for (let trayPos = 0; trayPos < trays.length; trayPos += 1) {
+      const tray = trays[trayPos];
       if (!tray.tray_type) continue; // empty slot — no filament loaded
+
+      const rawTrayId = parseInt(tray.id, 10);
+      const trayIndex = Number.isFinite(rawTrayId)
+        ? (trayIdsAreOneBased ? rawTrayId - 1 : rawTrayId)
+        : trayPos;
+
       slots.push({
-        slot:  amsId * 4 + parseInt(tray.id, 10),
+        slot:  amsIndex * 4 + trayIndex,
         type:  tray.tray_type,
         color: tray.tray_color || null,
+        brand: tray.tray_brand || tray.tray_sub_brands || '',
       });
     }
   }
 
   // External spool is always an option regardless of whether filament is loaded
   const vt = conn.latestPrint.vt_tray;
+  const externalType = typeof vt?.tray_type === 'string' ? vt.tray_type.trim() : '';
+  const externalColor = externalType ? (vt?.tray_color || null) : null;
+  const externalBrand = externalType ? (vt?.tray_brand || vt?.tray_sub_brands || '') : '';
   slots.push({
     slot:  -1,
-    type:  vt?.tray_type || '',
-    color: vt?.tray_color || null,
+    type:  externalType,
+    color: externalColor,
+    brand: externalBrand,
   });
 
   return slots;
+}
+
+// Formats AMS slot selections into Bambu's required ams_mapping shape: a fixed
+// 5-element array, right-aligned and left-padded with -1. The provided slots fill the
+// last N positions in order (filament 0 first), so [2, 3] becomes [-1, -1, -1, 2, 3].
+// Ref: https://github.com/Doridian/OpenBambuAPI mqtt.md → AMS Mapping Configuration.
+function buildAmsMapping(slots) {
+  const mapping = [-1, -1, -1, -1, -1];
+  const count = Math.min(slots.length, mapping.length);
+  for (let i = 0; i < count; i++) {
+    mapping[mapping.length - count + i] = slots[i];
+  }
+  return mapping;
 }
 
 // Uploads the G-code file to the printer via FTPS, then triggers printing via MQTT.
@@ -277,6 +450,27 @@ async function uploadAndPrint(printer, gcodeFullPath, _filename, options = {}) {
 
     await ftpClient.uploadFrom(gcodeFullPath, onPrinterFilename);
     console.log(`[bambu] Upload complete on ${printer.name}`);
+  } catch (err) {
+    if (!isFtpsSessionReuseError(err)) throw err;
+
+    console.warn(
+      `[bambu] ${printer.name} FTPS data-channel rejected TLS session reuse ` +
+      `(${err.message}). Retrying upload via curl fallback…`
+    );
+
+    try {
+      await uploadViaCurlFtps(printer, gcodeFullPath, onPrinterFilename);
+      console.log(`[bambu] Upload complete on ${printer.name} (curl fallback)`);
+    } catch (fallbackErr) {
+      const wrapped = Object.assign(
+        new Error(
+          `Bambu FTPS upload failed: printer requires TLS session reuse on data connections. ` +
+          `${fallbackErr.message}`
+        ),
+        { code: 'BAMBU_FTPS_SESSION_REUSE' }
+      );
+      throw wrapped;
+    }
   } finally {
     ftpClient.close();
   }
@@ -288,27 +482,39 @@ async function uploadAndPrint(printer, gcodeFullPath, _filename, options = {}) {
     throw new Error(`Bambu printer ${printer.name} MQTT not connected — cannot trigger print`);
   }
 
-  // ams_mapping format for LAN printing: a flat array where index = filament slot
-  // in the .3mf (0-based) and value = physical AMS tray ID (0-15).
-  // For single-color prints: [amsSlot] (one element).
-  // For external spool or no AMS: [] (empty).
+  // ams_mapping must be indexed by each filament's position in the .3mf project and
+  // sized to the project's filament count. buildAmsMappingFromThreeMf reads those real
+  // indices from the plate's slice_info.config; the padded single-list buildAmsMapping
+  // is only a fallback when the filament table cannot be read. A misindexed or
+  // variable-length array is rejected by stricter firmware such as the dual-nozzle X2D
+  // with "failed to get AMS mapping table". External spool / no AMS sends use_ams:false.
   // Ref: https://github.com/Doridian/OpenBambuAPI (issue #38 + mqtt.md)
   const subtaskName = path.basename(onPrinterFilename, '.3mf');
-  const useAms      = amsSlot != null && amsSlot >= 0;
+  const requestedAmsSlots = Array.isArray(options?.amsSlots) && options.amsSlots.length > 0
+    ? options.amsSlots
+    : (amsSlot != null && amsSlot >= 0 ? [amsSlot] : []);
+  const useAms = requestedAmsSlots.length > 0;
+  const { projectFileParam, bedType, plateIndex } = detectProjectMetadata(gcodeFullPath, options.plateNo ?? null);
+  const amsMapping = useAms
+    ? (buildAmsMappingFromThreeMf(gcodeFullPath, plateIndex, printer, requestedAmsSlots) || buildAmsMapping(requestedAmsSlots))
+    : [];
   const printPayload = {
     sequence_id:     '0',
     command:         'project_file',
-    param:           'Metadata/plate_1.gcode',
+    param:           projectFileParam,
     subtask_name:    subtaskName,
     url:             `ftp:///${onPrinterFilename}`,
-    bed_type:        'auto',
+    bed_type:        bedType,
     timelapse:       false,
     bed_leveling:    true,
     flow_cali:       false,
-    vibration_cali:  true,
+    // Some printers intermittently stall in preflight (for example waiting on
+    // heatbed temp while already at target) when vibration calibration is forced
+    // via MQTT. Keep this off and let the sliced project/printer defaults govern.
+    vibration_cali:  false,
     layer_inspect:   false,
     use_ams:         useAms,
-    ams_mapping:     useAms ? [amsSlot] : [],
+    ams_mapping:     amsMapping,
     profile_id:      '0',
     project_id:      '0',
     subtask_id:      '0',

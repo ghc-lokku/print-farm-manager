@@ -172,6 +172,8 @@ Per-machine history and annotation screen. Reached by clicking a printer card in
 
 **Edit Details form:** includes a Group field with a `<datalist>` autocomplete sourced from `GET /api/groups`, same free-text-plus-suggestions behavior as the Printers page bulk-edit and the Settings Add Printer form.
 
+**Live AMS panel (Bambu only):** active Bambu printers show a "Live AMS Slots" card sourced from `GET /api/printers/:id/ams`. Each entry shows the physical slot label (AMS unit + slot, plus External Spool), tray material, and color name/hex. Color names are resolved from Filament Library hex values when available.
+
 **Add note form:** freeform textarea → `POST /api/printers/:id/events`. Submitted note appears immediately at the top of the timeline.
 
 **Event timeline:** all `printer_events` rows for this printer, newest first. Each entry shows:
@@ -242,6 +244,7 @@ Primary operator screen for setting up and launching print runs.
   - `paused` → "Resume project" (same as Activate) or "Mark complete"
   - `completed` → "Re-activate" (`POST /api/projects/:id/reactivate`): reopens any closed parts that still have remaining qty and sweeps for idle printers immediately. Shows a warning toast instead of transitioning if every part is already at target qty (`nothing_to_reopen` in the response).
 - **Project-level targeting defaults:** two rows shown when a filament library or a group registry exists. *Filament*: Material/Color dropdowns → `PUT /api/projects/:id/filament`. *Groups*: checkboxes sourced from `GET /api/groups` → `PUT /api/projects/:id/groups`. Both apply to every G-code in the project that doesn't set its own override, and both are visible again in the per-gcode Targeting row below (Upload G-code and each G-code file's estimate row): a per-gcode value always wins over the project default, and the per-gcode picker's empty state reads "inherits project: X" instead of "all groups"/"any material" when a project default is set. See the "Targeting cascade" note in [database.md](database.md).
+- **Bambu color targeting behavior:** for single-color jobs, a required color can match either the printer's loaded color field or any currently loaded AMS/external tray color (mapped through Filament Library hex colors). This lets queued jobs target Bambu printers by available AMS color without enabling multi-color print mapping.
 - **Parts list:** each row shows name (with ▲/▼ priority buttons), a 3-segment progress bar, a fixed-width status badge (Open/Closed), and a Details toggle. A red `×` delete button appears at the far right — clicking it confirms then calls `DELETE /api/parts/:id`, which cascades to all jobs and G-code files for that part. Deletion is blocked (with an alert) if the part has an active uploading or printing job. All other editing is behind the Details button.
 
   **Progress bar segments:** green = `completed_qty` (confirmed done); blue = `active_qty` (parts currently printing across all active jobs); dark background = not yet started. When active jobs push the total past `target_qty`, the bar rescales against `max(target, completed + active)` and an amber tick marks the target. The count label shows `976 +24 printing / 1000` when jobs are active.

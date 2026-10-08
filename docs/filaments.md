@@ -73,7 +73,11 @@ The **Filament Library** section in Settings has two sub-sections:
 
 **Filament Types** — table of all types with delete buttons; add form with a required name field.
 
-**Filament Colors** — table of all colors (with hex swatch if provided) and delete buttons; add form with a required name field and optional hex color picker.
+**Filament Colors**: table of all colors (with hex swatch, hex code, and derived RGB / HSL values when a hex is set) and delete buttons; add form with a required name field and optional hex color picker.
+
+### Matching non-RFID filament by RGB / HSL
+
+Bambu's filament editor has no hex input, so a non-RFID spool (Polymaker, eSun, Sunlu, and similar) can only be given a color by typing RGB or HSL numbers. For every library color that has a hex, the colors table shows its RGB and HSL values; click a value to copy it. Set the AMS slot in the Bambu app to those numbers and the printer reports the matching hex over MQTT, which the dispatcher already matches against each plate's required color (see `server/color-matching.js`). Hex to RGB is exact; HSL is rounded to whole numbers for display, so prefer RGB when the app offers both.
 
 ## Client usage
 

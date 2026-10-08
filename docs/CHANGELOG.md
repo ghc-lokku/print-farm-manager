@@ -2,6 +2,401 @@
 
 ---
 
+## 2026-10-08: Managed filament brands with add/remove controls
+
+Filament brands are now managed as a canonical library list, similar to filament types. This reduces typo drift across project and gcode targeting, while keeping existing brand references safe.
+
+Settings now has a dedicated Brands section with add/remove controls, and filament color brand fields use the managed brand list. Brand deletion is guarded when a brand is still referenced by colors, project defaults, or gcode overrides.
+
+### Changes
+- `server/db.js`: added `filament_brands` table and startup seeding from existing color brand values.
+- `server/routes/filaments.js`: added `POST /api/filaments/brands` and guarded `DELETE /api/filaments/brands/:id`; `/api/filaments/brands` now returns managed brand names.
+- `client/src/pages/Settings.jsx`: added Brands management UI and switched color brand inputs to managed options.
+- `server/routes/backup.js`: added `filament_brands` to backup export/restore and restore counts.
+- `server/tests/filament-brands.test.js`: added route coverage for brand create/list/delete behavior.
+- `server/tests/backup-restore.test.js`: added backup/restore coverage for managed filament brands.
+- `docs/api.md`: documented filament brand create/delete endpoints.
+- `docs/filaments.md`: documented `filament_brands` schema and brand management behavior.
+
+## 2026-10-08: Import 3MF now auto-derives cleaner project names from filenames
+
+When choosing 3MF files for a new import, the Project Name field now auto-fills from filename stems with slicer suffix cleanup. Common suffix tokens such as size and model are removed, and separators such as underscores and hyphens are converted to spaces.
+
+This keeps default project names readable, and avoids carrying technical filename suffixes into project labels.
+
+### Changes
+- `client/src/pages/ImportThreeMf.jsx`: added filename-to-project-name inference that strips `_size_model` (or model-only) suffixes and normalizes separators to spaces when files are selected.
+
+## 2026-10-08: Plate-level brand targeting and icon actions in Filament Library
+
+Part details now include a plate-level filament brand control that applies one brand (or any) across every G-code row in that plate. This makes brand targeting faster when all model variants for the same plate should share the same brand requirement.
+
+The Filament Library table actions also now use compact icon buttons for edit and delete so row controls match the tighter control style used elsewhere in the app.
+
+### Changes
+- `client/src/pages/Projects.jsx`: added a "Plate Filament Targeting" section in part details with "Apply to Plate" brand updates across all G-codes in that part.
+- `client/src/pages/Settings.jsx`: replaced Filament Library Edit/Delete text buttons with pencil and trash icon buttons, preserving existing behavior and confirmation flows.
+
+## 2026-10-08: Import 3MF now matches the server-side size guard in the UI
+
+The Import 3MF page was rejecting some otherwise valid batches when a filename had no size suffix even though the server treated that file as a non-blocking case. This created a mismatch between the UI warning and the actual import behavior when the batch was otherwise a single size variant.
+
+The size check now only blocks batches with multiple explicit size suffixes, while missing suffixes remain acceptable as a no-constraint input. This keeps the import page aligned with the existing server route and prevents false “mixed size suffixes” errors for valid single-size batches.
+
+### Changes
+- `client/src/pages/ImportThreeMf.jsx`: removed the UI-only missing-size rejection so mixed-size validation matches the server route.
+- `server/tests/import-3mf.test.js`: added regression coverage for a valid batch that includes a file without a size suffix plus a matching explicit-size file.
+
+## 2026-10-07: Added single-plate queue, plate previews, brand targeting, and editable filament library rows
+
+Operators can now queue exactly one plate from a project part without waiting for normal project priority to reach it. This is useful when a specific plate variant must run next while keeping the rest of the queue unchanged.
+
+Projects and per-G-code targeting now support optional filament brand constraints, with an explicit any-brand choice. This allows color matching to stay strict by brand when desired (for example Polymaker White versus Bambu White) while preserving current behavior when brand is unset.
+
+The Projects detail view can now show embedded 3MF plate previews, and the Settings Filament Library now supports inline editing for both types and colors.
+
+### Changes
+- `server/scheduler.js`: added `queueSinglePlateForPart(partId)` and brand-aware candidate fields; dispatch now accepts one-off part-targeted reservations.
+- `server/routes/parts.js`: added `POST /api/parts/:id/queue-one`; dispatch diagnostics now include brand-aware checks.
+- `server/routes/gcodes.js`: added `GET /api/gcodes/:id/preview`; upload/update now accept `required_brand`.
+- `server/parse-3mf.js`: added binary ZIP entry extraction to serve embedded preview images.
+- `server/color-matching.js`: added brand-aware matching for Bambu tray color resolution and AMS slot selection.
+- `server/drivers/bambu.js`: AMS slot parsing now exposes `brand` from tray telemetry when firmware reports it.
+- `server/routes/filaments.js`: added `PUT /api/filaments/types/:id`, `PUT /api/filaments/colors/:id`, and `GET /api/filaments/brands`.
+- `server/db.js`: added additive columns `gcodes.required_brand`, `projects.required_brand`, and `filament_colors.brand`.
+- `client/src/pages/Projects.jsx`: added Queue 1 actions, per-G-code 3MF preview, and brand selectors in project defaults, upload targeting, and per-G-code targeting.
+- `client/src/pages/Settings.jsx`: added inline edit controls for filament types and colors, plus optional brand input for colors.
+- `docs/api.md`: documented queue-one, preview, brand targeting fields, and filament edit/brand endpoints.
+- `docs/filaments.md`: documented brand metadata and filament edit endpoints.
+- `docs/web-app.md`: documented new Projects and Settings behaviors.
+
+## 2026-10-06: Projects can now set one target quantity across all plates
+
+Large projects with many plates were tedious to scale because each part's target quantity had to be edited individually. Projects now have a project-level bulk target action that sets the same target quantity on every plate in one step.
+
+The server recalculates each part status from `completed_qty` against the new target, reopening parts that now have remaining work and closing parts that are already at or above the new target. If the project was completed and work now remains, it reactivates to active automatically. The scheduler then sweeps idle printers so reopened work can dispatch without a manual workaround.
+
+### Changes
+- `server/routes/projects.js`: added `POST /api/projects/:id/set-target-all` to set all part targets, reopen/close parts by status recalculation, reactivate completed projects when needed, and trigger scheduler sweep when remaining work exists.
+- `client/src/pages/Projects.jsx`: replaced the bulk quantity control with a "Set Target For All Plates" action and confirmation flow in project detail.
+- `server/tests/projects-set-target-all.test.js`: added coverage for validation, target updates, reopen/close behavior, project reactivation, and scheduler sweep trigger.
+- `docs/api.md`: documented `POST /api/projects/:id/set-target-all`.
+- `docs/web-app.md`: documented the new project-level bulk target control.
+
+## 2026-10-06: Import 3MF now blocks ambiguous multi-file multi-model assignment
+
+When importing or re-importing multiple 3MF files, choosing multiple global models could apply every selected model to every file. That creates duplicate per-model gcode rows per plate, and the newest row can inherit color data from the wrong source file (for example, an a1mini row with only Black when the plate should require Black and Yellow).
+
+Import now rejects that ambiguous combination with a clear validation error. For multi-file multi-model work, mapping must be explicit per file (or inferred from filename suffixes).
+
+### Changes
+- `server/routes/projects.js`: both `POST /api/projects/import-3mf` and `POST /api/projects/:id/reimport-3mf` now return `400` for ambiguous model assignment when multiple files are uploaded with multiple global models and no per-file mapping is provided.
+- `server/tests/import-3mf.test.js`: added regression coverage for the new import and re-import validation.
+
+## 2026-10-06: Dispatch now ignores stale duplicate G-code rows per model
+
+Some projects can accumulate legacy duplicate `gcodes` rows for the same `(part_id, printer_model)` after import/edit history. The scheduler candidate SQL and `/api/parts/:id/dispatch-status` both read raw `gcodes`, so an older stale row could be selected or evaluated instead of the current one, which can route a plate with the wrong color requirements.
+
+Dispatch and diagnostics now canonicalize to one row per `(part_id, printer_model)`, choosing the newest row (`MAX(gcodes.id)`). This keeps production behavior deterministic and keeps the Dashboard/Projects "dispatchable" signal aligned with what the scheduler will actually send.
+
+### Changes
+- `server/scheduler.js`: candidate selection now joins a canonicalized `gcodes` subquery (latest row per part/model).
+- `server/routes/parts.js`: `GET /api/parts/:id/dispatch-status` now evaluates the same canonicalized per-model gcode set.
+- `server/tests/dispatch-status.test.js`: regression for duplicate model rows preferring newest color rules.
+- `server/tests/scheduler-targeting.test.js`: regression for duplicate model rows preventing stale-color dispatch.
+
+## 2026-10-06: Dashboard shows every color on a multi-color part, not just the first
+
+A multi-color plate stores all of its colors in a single `required_color` string (parse-3mf joins them as "000000, FFFFFF"). The Dashboard's swatch resolver walked the per-part color list without splitting that string, and its hex normalizer kept only the text before the first comma, so a two-color part rendered a single swatch. Operators loading filament from the Dashboard could not tell a part needed a second color.
+
+The Dashboard now splits each required-color entry on the same delimiters the scheduler uses (comma, pipe, newline) and renders one swatch per color, carrying each color's name through to the swatch tooltip. This matches the Projects and Import 3MF pages, which already split before resolving.
+
+### Changes
+- `client/src/pages/Dashboard.jsx`: `getPartRequiredColors` now expands delimited multi-color strings into individual colors; `resolveColorSwatches` returns `{ name, hex }` so each swatch keeps its own tooltip label.
+
+## 2026-10-04: Projects can be deleted from any status, with a confirm modal
+
+Deleting a project was limited to `draft` status, so an operator who created an active or completed project by mistake (or was finished with one and wanted it off the list) had no way to remove it. Projects can now be deleted from any status through the status dropdown, and every delete is gated behind a confirmation modal so nothing is removed by a stray click.
+
+An in-flight print on an active project keeps running on the printer after delete, but its job record is gone, so no part count is credited when it finishes. This is the same no-credit path the scheduler already takes for a FINISHED printer with no matching job. The project's tag links are removed with it through the existing `project_tag_links` cascade.
+
+### Changes
+- `server/routes/projects.js`: `DELETE /api/projects/:id` no longer requires `draft` status; added a delete log line.
+- `client/src/pages/Projects.jsx`: added "Delete project" to the active, paused, and completed status menus (draft already had it); reuses the existing confirm modal path.
+- `docs/api.md`: documented `DELETE /api/projects/:id`.
+- `docs/web-app.md`: updated the status dropdown options to list Delete project for every status.
+- `server/tests/projects-delete.test.js`: new coverage for deleting across statuses, cascade cleanup, and 404.
+
+## 2026-10-03: AMS Lite trays now show correctly for Bambu A1 printers
+
+Some Bambu A1 printers reported live tray data in AMS Lite payload shapes that were not parsed by the existing AMS slot reader. That made Printer Details and scheduler logic see only the external spool even when AMS Lite trays were loaded.
+
+AMS slot parsing now supports both classic AMS unit payloads and AMS Lite tray-list payload variants, so all loaded trays are visible and eligible for dispatch matching.
+
+### Changes
+- `server/drivers/bambu.js`: expanded `getAmsSlots` to parse classic AMS units plus AMS Lite tray-list payload shapes (`ams.tray`, direct `ams` tray arrays, and top-level tray fallback).
+- `server/tests/bambu-driver.test.js`: added regression coverage for AMS Lite tray payload variants.
+
+## 2026-10-03: Dashboard active projects now support color swatches and collapse
+
+Large active queues with many parts were visually overwhelming on the Dashboard page. Active projects now default to collapsed rows, with per-project expand/collapse controls so operators can open only the project they are loading.
+
+Part rows in expanded projects now show required-color swatches, giving an at-a-glance cue for which filament colors should be loaded before dispatch.
+
+### Changes
+- `client/src/pages/Dashboard.jsx`: added per-project expand/collapse controls (default collapsed), project plate counts in headers, and per-part required-color swatches.
+- `server/routes/dashboard.js`: added `required_colors_json` and `effective_required_color` per part, including project-level required-color fallback when no gcode-level color override exists.
+- `docs/api.md`: documented the new dashboard part color helper fields.
+
+## 2026-10-03: Import 3MF now shows size and model filename template guidance
+
+Operators now have in-page filename guidance on Import 3MF for the recommended pattern `_<size>_<model>.gcode.3mf`, which matches backend auto-detection and size-variant safety checks.
+
+### Changes
+- `client/src/pages/ImportThreeMf.jsx`: added helper text and examples for `<project>_<size>_<model>.gcode.3mf`, plus a re-import note about size-variant validation.
+
+## 2026-10-03: Added size-family grouping and collapsible project variants
+
+Chunkable models commonly ship in multiple scales (for example 100% and 80%), which quickly bloats the project list when each scale is shown as a separate top-level row. Projects now support family and size metadata so variants can be grouped under one family name in the Projects list, with per-size actions to queue or open the exact variant.
+
+The grouped view is collapsible per family, so operators can shrink the list to just family names and expand only when choosing a size.
+
+### Changes
+- `server/db.js`: added `projects.family_name`, `projects.size_label`, and `projects.size_rank` with additive migration and startup backfill from existing project names.
+- `server/routes/projects.js`: project create, duplicate, and 3MF import now populate family/size metadata for consistent future grouping.
+- `client/src/pages/Projects.jsx`: added grouped size-variant cards, per-family expand/collapse controls, and per-size `Queue`/`Open` actions in list view.
+- `docs/api.md`: documented project size-family metadata fields in project payloads.
+
+## 2026-10-03: Added project tags and name-or-tag project search
+
+Operators needed a quick way to organize and find projects beyond status buckets. Projects now support reusable tags managed in Settings, assignable per project, and searchable from the Projects list by either project name or tag text.
+
+Tag assignment is stored in normalized tables (`project_tags`, `project_tag_links`) so tag names stay consistent and backup/restore keeps project-label mappings intact.
+
+### Changes
+- `server/db.js`: added `project_tags` and `project_tag_links` tables.
+- `server/routes/project-tags.js`: added tag CRUD endpoints (`GET`, `POST`, `DELETE`).
+- `server/index.js`: mounted `project-tags` route at `/api/project-tags`.
+- `server/routes/projects.js`: project list/detail now include `tags`, added `PUT /api/projects/:id/tags`, and duplicate-project now copies tag links.
+- `server/routes/backup.js`: backup export/restore now round-trips `project_tags` and `project_tag_links`.
+- `client/src/pages/Settings.jsx`: added Project Tags management section for creating and deleting tags.
+- `client/src/pages/Projects.jsx`: added list search by name or tag, tag chips in project rows, and tag assignment controls in project detail.
+- `server/tests/projects-tags.test.js`: added API coverage for tag CRUD and project tag assignment.
+- `server/tests/backup-restore.test.js`: extended backup/restore regression coverage for tag tables.
+- `docs/api.md`: documented project tag endpoints and `PUT /api/projects/:id/tags`.
+
+## 2026-10-03: Added re-import into existing project for 3MF updates
+
+`POST /api/projects/import-3mf` always creates a new project, which made iterative slicing changes painful when only a few plates changed. There is now a proper re-import path that updates an existing project in place.
+
+The new endpoint `POST /api/projects/:id/reimport-3mf` matches existing parts by plate number (`gcodes.plate_no`) first, then by part name prefix (`Plate N`). Matching parts are updated in place, newly introduced plates are added, and operators can choose how unmatched existing plates are handled (`keep`, `archive`, or `remove`). This keeps untouched plate history while allowing split-plate updates without duplicating the whole project.
+
+### Changes
+- `server/routes/projects.js`: added `POST /api/projects/:id/reimport-3mf` with in-place plate matching, G-code row updates, split-plate insertion, and configurable obsolete handling.
+- `client/src/pages/ImportThreeMf.jsx`: added import target mode (new project or existing project), project selector, and obsolete handling selector for re-import flows.
+- `server/tests/import-3mf.test.js`: added regression tests for in-place updates and archive handling during re-import.
+- `docs/api.md`: documented `POST /api/projects/:id/reimport-3mf` request/response and matching semantics.
+
+## 2026-10-03: Added manual hold for printer reservation outside queued jobs
+
+Operators sometimes need to run a printer manually for work that is not yet modeled by queue dispatch, such as a four-color flexy setup with per-printer preparation. The Fleet page can now place a printer on manual hold so it stays out of queued dispatch until the operator releases it.
+
+Manual hold is separate from normal print outcome confirmation holds. This prevents manual reservations from being shown as "awaiting confirmation" and protects manual holds from being auto-cleared by transient OFFLINE to PRINTING recovery logic.
+
+### Changes
+- `server/db.js`: added `printers.manual_hold` with additive migration defaulting to `0`.
+- `server/routes/printers.js`: added `POST /api/printers/:id/manual-hold` and `POST /api/printers/:id/release-hold`; clear-stopped now also clears `manual_hold`.
+- `server/index.js`: set-ready, batch set-ready, and recommission now clear `manual_hold` together with `is_held`.
+- `server/scheduler.js`: OFFLINE recovery auto-unhold now skips printers on manual hold.
+- `client/src/pages/Fleet.jsx`: added Manual Hold and Release Manual Hold actions, manual-hold status messaging, and a manual-hold summary banner.
+- `server/tests/printers-decommission.test.js`: added regression coverage for manual hold and release-hold scheduler behavior.
+- `docs/api.md`: documented manual hold field and endpoints.
+
+## 2026-10-03: Bambu dispatch now strictly prefers exact model G-code rows
+
+In mixed-model Bambu projects, some dispatches selected an alternate-model row (for example `p2s`) even when an exact row (for example `x1c`) existed for the same plate. This made Fleet appear to send the wrong model file to a printer.
+
+Scheduler model selection now runs in two passes for Bambu printers: exact model first, then alternate-model fallback only when no exact row is available under the same queue filters.
+
+### Changes
+- `server/scheduler.js`: replaced combined model predicate ordering with two-pass candidate lookup (`printer_model = exact` first, `printer_model != exact` fallback second).
+- `server/tests/scheduler-targeting.test.js`: added regression coverage proving exact-model preference when both exact and alternate rows exist.
+
+## 2026-10-03: Dispatch diagnostics no longer claim alternate-model blockers when another model can run now
+
+The part dispatch diagnostic could report messages like "no active printers of model p2s" even when another model row (for example `x1c`) was immediately dispatchable for the same part. This was misleading in the project plate details and looked like the queue was waiting on the wrong model.
+
+Dispatch diagnostics now suppress per-model blocked notes whenever at least one model row is currently dispatchable.
+
+### Changes
+- `server/routes/parts.js`: collect per-model blocked notes and only return them when no model row is dispatchable.
+- `server/tests/dispatch-status.test.js`: added regression coverage for mixed-model parts where one row is blocked and another is ready.
+
+## 2026-10-03: Dispatch diagnostics now prioritize models present in the active fleet
+
+Mixed-model parts can contain G-code rows for several printer models. When a farm only has one of those models active, diagnostics should not keep surfacing blockers for absent models. This could show "waiting on p2s" even though `x1c` was the relevant path for that farm.
+
+Dispatch diagnostics now evaluate only the part's models that are present in the active fleet (when any are present). If none of the part's models exist in the active fleet, diagnostics falls back to checking all rows and reports the missing-model blockers as before.
+
+### Changes
+- `server/routes/parts.js`: added active-fleet model filtering for mixed-model part diagnostics.
+- `server/tests/dispatch-status.test.js`: added regression coverage for reachable-model busy state without absent-model noise.
+
+## 2026-10-02: Filament Library shows RGB and HSL for matching non-RFID spools
+
+Bambu's filament editor has no hex input, so operators loading non-RFID filament (Polymaker, eSun, Sunlu, and similar) into an AMS could only pick from Bambu's palette, which rarely matches the exact hex a plate was sliced with. The dispatcher matches a Bambu printer's loaded AMS trays to a plate's required color by hex, so a close-but-wrong palette color would not match and the plate would skip that printer.
+
+The Filament Library colors table now derives and displays the RGB and HSL values of each color's hex. Operators copy those numbers into the Bambu filament editor so the AMS slot reports the intended hex over MQTT, which the existing color matcher then matches against the plate. This stays read-only: Print Farm Manager does not write to the AMS, so there is no new driver payload and nothing to validate on hardware. Hex to RGB is exact; HSL is rounded to whole numbers for display.
+
+### Changes
+- `client/src/pages/Settings.jsx`: added `hexToRgb` / `rgbToHsl` helpers and a new RGB / HSL column (click to copy) in the Filament Library colors table, plus a short usage hint.
+- `docs/filaments.md`: documented the RGB / HSL display and the non-RFID AMS matching workflow.
+
+## 2026-10-02: 3MF import now supports multi-file project intake
+
+Operators can now import several sliced `.3mf` files in one action and keep them in one project, instead of repeating project creation for each machine-specific slice.
+
+`POST /api/projects/import-3mf` now accepts either `file` or `files[]`, plus optional `file_printer_models` (JSON array) to assign one model per uploaded file. Model resolution per file now runs in this order: `file_printer_models[i]`, then global `printer_models`, then global `printer_model`, then filename suffix auto-detect.
+
+Plates are now grouped by `plate_index` across uploaded files. This means `Plate 1` appears once in the project and contains multiple model/file G-code targets under the same part.
+
+### Changes
+- `server/routes/projects.js`: added multi-file upload support (`file` or `files[]`), per-file model assignment via `file_printer_models`, grouping by `plate_index` across files, and grouped source file metadata in response plates.
+- `client/src/pages/ImportThreeMf.jsx`: added multi-file picker and model assignment mode for either global model selection or one model per file.
+- `server/tests/import-3mf.test.js`: added regression coverage for multi-file import and `file_printer_models` length validation.
+- `docs/api.md`: documented `files`, `file_printer_models`, per-file model resolution order, grouped-by-plate behavior, and updated validation cases.
+
+## 2026-10-02: 3MF import supports multiple printer models in one project
+
+Import now supports creating model-specific G-code rows for several Bambu models in one pass while keeping a single project and shared plate parts. This avoids creating printer-specific duplicate projects and keeps scheduling centered on one project queue.
+
+`POST /api/projects/import-3mf` now accepts `printer_models` (JSON array string or comma-separated list). For each imported plate, the route creates one Part and one G-code row per selected model, all pointing at the same uploaded `.3mf` and `plate_no`.
+
+Model resolution order is now: `printer_models` first, then `printer_model`, then filename suffix auto-detect. All resolved models are validated against `printer_models` and must use connector `bambu`.
+
+### Changes
+- `server/routes/projects.js`: added `printer_models` parsing and per-plate multi-model G-code creation while keeping a single project.
+- `client/src/pages/ImportThreeMf.jsx`: replaced single-model selector with optional multi-select and sends `printer_models` when chosen.
+- `server/tests/import-3mf.test.js`: added regression coverage for two-model imports creating four G-code rows across two plates.
+- `docs/api.md`: documented `printer_models` input, resolution order, and the expanded response shape.
+
+## 2026-10-02: 3MF import can auto-detect printer model from filename suffix
+
+To reduce manual entry when batch-importing sliced files, `POST /api/projects/import-3mf` now accepts an omitted `printer_model` when the uploaded filename ends with a model suffix. This supports names like `widget_x1c.gcode.3mf` and `widget_x1c.3mf`.
+
+The importer now resolves model in this order: explicit `printer_model` field first, otherwise filename suffix. The resolved model must still exist in `printer_models` and use the `bambu` connector, preserving existing validation and dispatch safety.
+
+### Changes
+- `server/routes/projects.js`: added filename-based model detection for `.3mf` imports (`*_model.3mf`, `*_model.gcode.3mf`, `*_model.bgcode.3mf`) and fallback validation when `printer_model` is omitted.
+- `client/src/pages/ImportThreeMf.jsx`: made model selection optional and documented the filename suffix convention in the form.
+- `server/tests/import-3mf.test.js`: added coverage for auto-detect success and omitted-model failure when filename has no model suffix.
+- `docs/api.md`: documented the `POST /api/projects/import-3mf` endpoint and suffix-based model detection behavior.
+
+## 2026-10-02: Docker publishes port 80 for hostname-only access
+
+Operators asked for a simpler URL so other machines on the LAN can open the app by hostname or IP without remembering `:3000`. The production Docker service now publishes host port 80 to container port 3000.
+
+This does not change the app's internal listen port and does not affect bare-metal installs. It only updates Docker host port exposure and Docker docs examples.
+
+### Changes
+- `docker-compose.yml`: production `print-farm-manager` service publishes host `80:3000`.
+- `README.md`: updated Docker compose snippet and `docker run` example to use `80:3000`, and updated access/security notes accordingly.
+
+## 2026-10-01: Bambu ams_mapping must be indexed by the .3mf's real filament indices
+
+Follow-up to the 5-element padding fix below. After that change the X2D still stopped at print start with "failed to get AMS mapping table", even though the payload now carried the documented shape `[-1,-1,-1,2,3]`. Inspecting the actual plate's `Metadata/slice_info.config` showed why: this plate uses the project's 5th and 6th filaments (`<filament id="5" color="#000000">` Black, `<filament id="6" color="#FFFFFF">` White) inside a 6-filament project (`filament_maps` has 6 entries). Bambu indexes `ams_mapping` by each filament's position in the project (0-based `id - 1`) and sizes the array to the project's filament count, so the printer expected Black's tray at index 4 and White's at index 5: `[-1,-1,-1,-1,2,3]`. Our driver had placed the trays at indices 3 and 4 in a 5-length array, so the printer could not match the mapping to its filament table.
+
+The Bambu driver now reads the plate's filament table from the .3mf and builds `ams_mapping` aligned to those real indices: each used filament's color is matched to a currently loaded AMS tray by hex, and the tray is placed at the filament's index in an array sized to the project's filament count. When the filament table or a color cannot be read, it falls back to the scheduler's color-matched trays aligned to the used filament ids, and finally to the padded single-list format, so single-color and external-spool prints are unaffected.
+
+Implemented from the .3mf's own `slice_info.config` and the OpenBambuAPI protocol doc. The multi-color X2D print is not yet confirmed started on hardware; that is the next live step.
+
+### Changes
+- `server/drivers/bambu.js`: added `openThreeMf` (shared .3mf ZIP reader), `parsePlateFilaments` (reads the plate's filament ids, colors, and project filament count from `slice_info.config`), and `buildAmsMappingFromThreeMf`; `uploadAndPrint` now builds `ams_mapping` aligned to real filament indices with the padded single-list format as a fallback. `detectProjectMetadata` reuses `openThreeMf` and returns the selected `plateIndex`.
+- `server/tests/bambu-driver.test.js`: added a multi-filament regression (filaments 5 and 6 of a 6-filament project map to `[-1,-1,-1,-1,2,3]`).
+
+## 2026-10-01: Bambu ams_mapping must be a fixed 5-element padded array
+
+A multi-color plate (Black and White eyes) dispatched to a new dual-nozzle X2D uploaded successfully but the printer refused to start, reporting "failed to get AMS mapping table". The file transfer was fine; the MQTT `project_file` command carried `ams_mapping: [2, 3]`, a variable-length left-aligned array. A live MQTT probe confirmed the X2D had Black in tray 2 and White in tray 3, so the slot numbers were correct. The official protocol reference (OpenBambuAPI mqtt.md, "AMS Mapping Configuration") specifies that `ams_mapping` must be a fixed 5-element array, right-aligned and left-padded with -1: a single color is `[-1, -1, -1, -1, X]` and two colors are `[-1, -1, -1, X, Y]`. Stricter firmware such as the X2D rejects any other shape; the X1C had tolerated the shorter array, which is why single-color prints worked before.
+
+The Bambu driver now formats `ams_mapping` into the documented 5-element padded shape for every AMS print, preserving filament order. External-spool and no-AMS prints are unchanged (`use_ams` false, empty mapping).
+
+Implemented from the OpenBambuAPI protocol doc and a live MQTT AMS probe of the X2D; the padded payload itself is not yet validated on hardware. The X1C single-color path changed shape (from `[X]` to `[-1, -1, -1, -1, X]`) and should be re-verified on an X1C alongside the X2D multi-color print.
+
+### Changes
+- `server/drivers/bambu.js`: added `buildAmsMapping` and send `ams_mapping` as a fixed 5-element array, right-aligned and left-padded with -1, matching the OpenBambuAPI spec; a variable-length array caused "failed to get AMS mapping table" on the dual-nozzle X2D.
+- `server/tests/bambu-driver.test.js`: updated single-slot assertions to the padded shape and added a multi-color `[2, 3]` to `[-1, -1, -1, 2, 3]` case.
+
+## 2026-10-01: normalize brand-prefixed filament color names
+
+A valid queue match was being rejected when a printer reported a loaded color such as "Sunlu White" or "Bambu Black" instead of the canonical filament library name "White" or "Black". The scheduler compared the raw text directly, so the color matched by the physical spool but still failed dispatch eligibility.
+
+The color matcher now normalizes brand prefixes and suffix aliases before comparing required color names to the printer's loaded color or live AMS tray color, while keeping exact hex matches and the live Bambu AMS lookup intact.
+
+### Changes
+- `server/color-matching.js`: added shared brand-prefix and suffix normalization so printer-loaded color strings match canonical filament library names without breaking exact hex matching or Bambu AMS tray checks.
+- `server/tests/scheduler-targeting.test.js`: added a regression proving that `Sunlu White` matches a required `White` color and dispatches correctly.
+- `docs/api.md`: clarified that required-color matching accepts canonical filament names even when the printer reports a brand-prefixed label such as `Sunlu White`.
+
+## 2026-09-27: Bambu FTPS fallback and AMS slot index fixes
+
+After enabling FTPS session-reuse fallback, live uploads still failed for jobs whose `.3mf` filename contained spaces. The fallback path built a raw FTPS URL from the filename, and curl rejected it with `curl: (3) URL using bad/illegal format or missing URL` before any transfer attempt.
+
+The fallback uploader now URL-encodes the remote filename before invoking curl, so filenames with spaces can upload through the session-reuse fallback path.
+
+During live validation after upload recovery, one dispatch entered "Preparing AMS" and did not proceed. Runtime payload logs showed `ams_mapping:[4]` for a first-unit tray selection, indicating one-based AMS IDs from device status were being treated as zero-based slot indexes. AMS slot extraction now normalizes one-based unit/tray IDs to the zero-based compound slots expected by the dispatch payload.
+
+A second live issue remained after upload recovery: some jobs still sent stale per-file `gcodes.ams_slot` values even when color matching had already found a different loaded AMS tray. Scheduler now prefers the live color-matched slot for Bambu required-color jobs, which keeps dispatch tray selection aligned with current AMS inventory.
+
+Live AMS UI also showed a phantom external color on printers with no external filament loaded because `vt_tray` can retain a stale color code after unload. External slot color is now suppressed unless an external filament type is present.
+
+Another runtime failure surfaced on Anchor: uploads succeeded, but the printer asked to send the file again. Root cause was a fixed `project_file.param` of `Metadata/plate_1.gcode` while some sliced files only contain `Metadata/plate_2.gcode` (or other plate indices). The Bambu driver now inspects the `.3mf` archive central directory and chooses the first available `Metadata/plate_N.gcode` entry instead of assuming plate 1.
+
+After that fix, Anchor still intermittently paused/stopped during start-up with heatbed-wait behavior. Root cause was another hardcoded payload field: `bed_type: "auto"` even when the selected plate metadata specifies a concrete bed type. The Bambu driver now reads `Metadata/plate_N.json` for the selected plate and uses its `bed_type` value in the `project_file` command.
+
+We also observed that forcing `vibration_cali: true` could trigger preflight calibration behavior (`auto_cali_for_user_param.gcode`) on some machines, which correlated with intermittent start stalls. The Bambu payload now leaves vibration calibration off in MQTT starts so the printer and sliced profile defaults govern that step.
+
+Implemented from runtime log evidence, not yet validated on hardware.
+
+### Changes
+- `server/drivers/bambu.js`: URL-encode the remote filename in the curl FTPS fallback URL to prevent curl URL parse failures on spaces and other reserved characters.
+- `server/drivers/bambu.js`: normalize one-based AMS unit/tray IDs to zero-based compound slot indexes so `ams_mapping` targets the expected tray.
+- `server/drivers/bambu.js`: clear external-slot color when `vt_tray` has no loaded filament type, preventing stale phantom colors in AMS UI and color matching.
+- `server/color-matching.js`: added live slot selection helper for Bambu required-color jobs.
+- `server/scheduler.js`: override stale `gcodes.ams_slot` with the live color-matched Bambu slot when dispatching required-color jobs.
+- `server/tests/bambu-driver.test.js`: added regression coverage for curl URL encoding, one-based AMS/tray ID normalization, and stale external color suppression.
+- `server/drivers/bambu.js`: detect the correct `Metadata/plate_N.gcode` entry from each `.3mf` and use it in the MQTT `project_file` payload.
+- `server/drivers/bambu.js`: parse the selected plate's `Metadata/plate_N.json` and send its `bed_type` instead of hardcoding `auto`.
+- `server/drivers/bambu.js`: set `vibration_cali` to `false` for MQTT-started jobs to avoid forced preflight calibration stalls.
+- `server/tests/bambu-driver.test.js`: added regression coverage for dynamic `.3mf` plate entry detection.
+- `server/tests/bambu-driver.test.js`: extended coverage to validate dynamic `bed_type` selection from plate metadata.
+- `server/tests/scheduler-targeting.test.js`: added regression coverage that required-color Bambu dispatch uses the live matched slot over stale `gcodes.ams_slot`.
+
+## 2026-09-27: single-color Bambu dispatch can match required color from AMS slots
+
+Operators wanted single-color queueing by currently loaded AMS colors without adding multi-color print mapping. Before this change, targeting compared `required_color` only to `printers.loaded_color`, so a Bambu printer with the right color physically loaded in an AMS slot was treated as a mismatch unless the same color was also manually set on the printer row.
+
+Now color eligibility for Bambu printers includes currently loaded AMS/external trays from live MQTT state. Tray hex colors are mapped to Filament Library color names via `filament_colors.hex_color`, then matched against `required_color`. Existing behavior is preserved for all other printers, and `loaded_color` remains a valid direct match for every connector.
+
+During validation, Bambu uploads in Docker repeatedly failed with `Premature close` even though TCP port 990 was reachable. Root cause was confirmed with an in-container FTPS probe: login succeeds, then data-channel operations fail with `522 SSL connection failed: session reuse required`. The Bambu driver now detects this specific FTPS behavior and falls back to a `curl` FTPS upload attempt; if that fails too, it raises a dedicated `BAMBU_FTPS_SESSION_REUSE` error so scheduler notifications are explicit instead of generic retry noise.
+
+This was applied to both dispatch candidate selection and the operator-facing `GET /api/parts/:id/dispatch-status` diagnostic to keep behavior and explanations aligned.
+
+Implemented from protocol docs and existing Bambu driver state cache, not yet validated on hardware.
+
+### Changes
+- `server/color-matching.js`: new shared helper for required-color matching, including Bambu AMS tray lookup and hex-to-name mapping through Filament Library.
+- `server/scheduler.js`: candidate selection now evaluates required color via shared matcher, so Bambu printers can satisfy `required_color` from any loaded AMS/external tray.
+- `server/routes/parts.js`: `dispatch-status` now uses the same matcher and reports AMS-aware color mismatch reasons.
+- `server/routes/printers.js`: added `GET /api/printers/:id/ams` for printer-specific live AMS inventory (returns `[]` for non-Bambu/inactive printers).
+- `server/drivers/bambu.js`: added FTPS session-reuse error detection and `curl`-based FTPS upload fallback; emits dedicated `BAMBU_FTPS_SESSION_REUSE` failures when fallback cannot complete.
+- `client/src/pages/PrinterDetail.jsx`: added a Bambu-only "Live AMS Slots" panel so operators can verify current slot material/color on the exact machine.
+- `Dockerfile`: installed `curl` in runtime and dev images so fallback upload is available in container deployments.
+- `server/tests/scheduler-targeting.test.js`: added Bambu AMS color-match and mismatch coverage.
+- `server/tests/dispatch-status.test.js`: added Bambu AMS color-match diagnostic coverage with mocked AMS slot data.
+- `server/tests/printers-filaments.test.js`: added coverage for `GET /api/printers/:id/ams` behavior (404, non-Bambu/inactive empty, live Bambu slots).
+- `server/tests/bambu-driver.test.js`: added coverage for FTPS session-reuse fallback success and dedicated failure code.
+- `docs/api.md`, `docs/web-app.md`: documented AMS-aware single-color targeting behavior plus the new printer-specific AMS endpoint and UI panel.
+
 ## 2026-09-01: printerIdle bypass let dispatch exceed dispatch_batch_size
 
 Joel batch-confirmed a stack of held printers via Set Ready (N) with `dispatch_batch_size` set to 5, then individually confirmed roughly ten more printers that had shown a false failed-upload hold (the upload attempt was reported failed on our side, but the printer had actually completed the print). Fleet's uploading count briefly showed 7 concurrent uploads against the configured limit of 5.

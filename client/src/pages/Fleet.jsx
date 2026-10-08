@@ -55,7 +55,7 @@ function formatEta(secs) {
   return `done ${time}`;
 }
 
-function PrinterCard({ printer, selected, onToggleSelect, onSetReady, onBadPrint, onUploadFailed, onDecommission, onLinkJob, onOpenDetail }) {
+function PrinterCard({ printer, selected, onToggleSelect, onSetReady, onBadPrint, onUploadFailed, onDecommission, onRecoverStopped, onManualHold, onReleaseHold, onLinkJob, onOpenDetail }) {
   const shownStatus = displayStatus(printer);
   const style = statusStyle(shownStatus);
   const isUploading = shownStatus === 'UPLOADING';
@@ -85,6 +85,7 @@ function PrinterCard({ printer, selected, onToggleSelect, onSetReady, onBadPrint
   useEffect(() => {
     if (isPartial && selected) onToggleSelect(printer.id);
   }, [isPartial]); // eslint-disable-line react-hooks/exhaustive-deps
+  const isManualHold = printer.manual_hold === 1;
   // Show confirmation buttons only when there's something to inspect.
   // A printer that is actively printing is held-in-advance — it will need sign-off
   // when it finishes, but there is nothing to confirm right now.
@@ -92,7 +93,9 @@ function PrinterCard({ printer, selected, onToggleSelect, onSetReady, onBadPrint
   // print starts, with nothing to acknowledge on the printer screen — the only way out
   // is confirming here so the farm dispatches a new job.
   const needsConfirmation = printer.is_held === 1
+    && !isManualHold
     && (printer.status === 'FINISHED' || printer.status === 'IDLE' || printer.status === 'STOPPED');
+  const canRecoverFromStopped = printer.is_active === 1 && printer.status === 'STOPPED';
   // OFFLINE with an active job: printer dropped off network but job may still be running.
   // Operator can confirm the job is OK (green = resume) or declare it failed (red).
   // If the printer comes back PRINTING on its own, the hold is released automatically.
@@ -208,6 +211,46 @@ function PrinterCard({ printer, selected, onToggleSelect, onSetReady, onBadPrint
             : 'Print stopped from printer screen — returns to service on next dispatch'}
         </div>
       )}
+
+      {canRecoverFromStopped && (
+        <div onClick={(e) => e.stopPropagation()} style={{ marginTop: 4 }}>
+          <button
+            onClick={() => onRecoverStopped(printer.id)}
+            title="Clear the hold and return this stopped printer to the dispatch queue without decommissioning it"
+            style={{ width: '100%', background: '#1d4ed8', color: '#dbeafe', border: 'none', borderRadius: 6, padding: '5px 0', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+          >
+            Back Online
+          </button>
+        </div>
+      )}
+
+      {isManualHold && (
+        <div style={{ fontSize: 11, color: '#93c5fd', marginTop: 4 }}>
+          Manual hold active - this printer will not pick up new queued jobs.
+        </div>
+      )}
+
+      <div onClick={(e) => e.stopPropagation()} style={{ marginTop: 2 }}>
+        {isManualHold ? (
+          <button
+            onClick={() => onReleaseHold(printer.id)}
+            title="Release manual hold and return this printer to normal queue dispatch"
+            style={{ background: 'none', color: '#4ade80', border: '1px solid #166534', borderRadius: 6, padding: '3px 8px', fontSize: 11, cursor: 'pointer' }}
+          >
+            Release Manual Hold
+          </button>
+        ) : (
+          <button
+            onClick={() => onManualHold(printer.id)}
+            title={isPrinting
+              ? 'Keep printing the current plate, but hold this printer from future queued jobs'
+              : 'Hold this printer from receiving queued jobs until you release it'}
+            style={{ background: 'none', color: '#93c5fd', border: '1px solid #1e3a5f', borderRadius: 6, padding: '3px 8px', fontSize: 11, cursor: 'pointer' }}
+          >
+            {isPrinting ? 'Hold After Current Job' : 'Manual Hold'}
+          </button>
+        )}
+      </div>
 
       {needsConfirmation && !needsUploadConfirmation && (
         <div onClick={(e) => e.stopPropagation()} style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4 }}>
@@ -360,9 +403,12 @@ export default function Fleet() {
   }, [fetchPrinters]);
 
   // Printers awaiting operator confirmation — excludes those currently printing (hold is pre-set for when they finish)
-  const awaitingConfirmation = printers.filter(p => p.is_held === 1 && (p.status === 'FINISHED' || p.status === 'IDLE') && p.has_uploading_job === 0);
+  const awaitingConfirmation = printers.filter(
+    p => p.is_held === 1 && p.manual_hold !== 1 && (p.status === 'FINISHED' || p.status === 'IDLE') && p.has_uploading_job === 0
+  );
   const awaitingOfflineReview = printers.filter(p => p.is_held === 1 && p.status === 'OFFLINE' && p.has_active_job === 1);
   const awaitingUploadReview = printers.filter(p => p.is_held === 1 && p.has_uploading_job === 1 && p.status !== 'OFFLINE');
+  const manualHoldCount = printers.filter(p => p.manual_hold === 1).length;
 
   function toggleSelect(printerId) {
     setSelectedForReady(prev => {
@@ -452,6 +498,86 @@ export default function Fleet() {
       });
     }
 
+    fetchPrinters();
+  }
+
+  async function recoverStopped(printerId) {
+    const printer = printers.find(p => p.id === printerId);
+    const result = await confirm({
+      title: `Recover ${printer?.name}?`,
+      message: 'This clears the stopped-state hold and returns the printer to the active fleet without decommissioning it. It is safe only when the machine is physically ready to run again.',
+      confirmLabel: 'Back Online',
+      prompt: 'Optional note',
+      danger: false,
+    });
+    if (!result) return;
+
+    const res = await fetch(`/api/printers/${printerId}/clear-stopped`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note: result.text || null }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      showToast(`Could not recover printer: ${body.error || res.status}`, 'error');
+      return;
+    }
+
+    showToast(`${printer?.name || 'Printer'} is back online`, 'success');
+    fetchPrinters();
+  }
+
+  async function setManualHold(printerId) {
+    const printer = printers.find(p => p.id === printerId);
+    const result = await confirm({
+      title: `Hold ${printer?.name}?`,
+      message: printer?.status === 'PRINTING'
+        ? 'The current print will continue, but this printer will not receive another queued job when it finishes until you release the hold.'
+        : 'This printer will stop receiving queued jobs until you release the hold.',
+      confirmLabel: 'Enable Hold',
+      prompt: 'Optional note',
+      danger: false,
+    });
+    if (!result) return;
+
+    const res = await fetch(`/api/printers/${printerId}/manual-hold`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note: result.text || null }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      showToast(`Could not hold printer: ${body.error || res.status}`, 'error');
+      return;
+    }
+
+    showToast(`${printer?.name || 'Printer'} placed on manual hold`, 'success');
+    fetchPrinters();
+  }
+
+  async function releaseManualHold(printerId) {
+    const printer = printers.find(p => p.id === printerId);
+    const result = await confirm({
+      title: `Release hold on ${printer?.name}?`,
+      message: 'This puts the printer back into normal dispatch. If a matching queued job exists, it may start immediately.',
+      confirmLabel: 'Release Hold',
+      prompt: 'Optional note',
+      danger: false,
+    });
+    if (!result) return;
+
+    const res = await fetch(`/api/printers/${printerId}/release-hold`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note: result.text || null }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      showToast(`Could not release hold: ${body.error || res.status}`, 'error');
+      return;
+    }
+
+    showToast(`${printer?.name || 'Printer'} is back in queue dispatch`, 'success');
     fetchPrinters();
   }
 
@@ -749,6 +875,26 @@ export default function Fleet() {
         </div>
       )}
 
+      {manualHoldCount > 0 && (
+        <div style={{
+          background: '#0f1f3d',
+          border: '1px solid #1e3a8a',
+          borderRadius: 8,
+          padding: '10px 16px',
+          marginBottom: 16,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+        }}>
+          <span style={{ color: '#93c5fd', fontWeight: 600, fontSize: 14 }}>
+            {manualHoldCount} printer{manualHoldCount !== 1 ? 's' : ''} on manual hold
+          </span>
+          <span style={{ color: '#60a5fa', fontSize: 13 }}>
+            Release hold when ready to return them to queued jobs
+          </span>
+        </div>
+      )}
+
       {/* Confirmation banner */}
       {awaitingConfirmation.length > 0 && (
         <div style={{
@@ -884,6 +1030,9 @@ export default function Fleet() {
                 onBadPrint={badPrint}
                 onUploadFailed={uploadFailed}
                 onDecommission={decommission}
+                onRecoverStopped={recoverStopped}
+                onManualHold={setManualHold}
+                onReleaseHold={releaseManualHold}
                 onLinkJob={openLinkJobModal}
                 onOpenDetail={(id) => navigate(`/printers/${id}`)}
               />

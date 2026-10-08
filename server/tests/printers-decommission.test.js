@@ -24,6 +24,7 @@ beforeAll(() => {
       model            TEXT NOT NULL,
       status           TEXT DEFAULT 'UNKNOWN',
       is_held          INTEGER DEFAULT 1,
+      manual_hold      INTEGER DEFAULT 0,
       is_active        INTEGER DEFAULT 1,
       decommissioned_at INTEGER,
       decommission_note TEXT,
@@ -138,6 +139,92 @@ function seedJob(printerId, partId, gcodeId, status = 'finished', partsPerPlate 
 }
 
 // ── POST /api/printers/:id/mark-job-failure ───────────────────────────────────
+
+describe('POST /api/printers/:id/clear-stopped', () => {
+  test('releases a stopped printer back to the active fleet without decommissioning it', async () => {
+    const scheduler = { scheduleForPrinter: jest.fn() };
+    const resumeApp = express();
+    resumeApp.use(express.json());
+    resumeApp.use('/api/printers', require('../routes/printers')(db, scheduler));
+
+    const printerId = seedPrinter({ name: `Printer_resume_${Date.now()}`, status: 'STOPPED', is_held: 1, is_active: 1 });
+
+    const res = await request(resumeApp).post(`/api/printers/${printerId}/clear-stopped`);
+    expect(res.status).toBe(200);
+    expect(res.body.is_held).toBe(0);
+    expect(res.body.is_active).toBe(1);
+    expect(res.body.decommissioned_at).toBeNull();
+    expect(scheduler.scheduleForPrinter).toHaveBeenCalledWith(expect.objectContaining({ id: printerId }));
+
+    const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(printerId);
+    expect(printer.is_held).toBe(0);
+    expect(printer.is_active).toBe(1);
+    expect(printer.decommissioned_at).toBeNull();
+  });
+
+  test('cancels lingering active job during stopped-state recovery', async () => {
+    const scheduler = { scheduleForPrinter: jest.fn() };
+    const resumeApp = express();
+    resumeApp.use(express.json());
+    resumeApp.use('/api/printers', require('../routes/printers')(db, scheduler));
+
+    const projectId = seedProject();
+    const partId = seedPart(projectId, 4, 0);
+    const gcodeId = seedGcode(partId);
+    const printerId = seedPrinter({ name: `Printer_resume_stale_${Date.now()}`, status: 'STOPPED', is_held: 1, is_active: 1 });
+    const jobId = seedJob(printerId, partId, gcodeId, 'printing', 4);
+
+    const res = await request(resumeApp).post(`/api/printers/${printerId}/clear-stopped`);
+    expect(res.status).toBe(200);
+    expect(res.body.is_held).toBe(0);
+
+    const job = db.prepare('SELECT status FROM jobs WHERE id = ?').get(jobId);
+    expect(job.status).toBe('cancelled');
+    expect(scheduler.scheduleForPrinter).toHaveBeenCalledWith(expect.objectContaining({ id: printerId }));
+  });
+});
+
+describe('POST /api/printers/:id/manual-hold', () => {
+  test('marks printer as manually held without decommissioning', async () => {
+    const scheduler = { scheduleForPrinter: jest.fn() };
+    const holdApp = express();
+    holdApp.use(express.json());
+    holdApp.use('/api/printers', require('../routes/printers')(db, scheduler));
+
+    const printerId = seedPrinter({ name: `Printer_manual_hold_${Date.now()}`, status: 'PRINTING', is_held: 0, is_active: 1 });
+
+    const res = await request(holdApp)
+      .post(`/api/printers/${printerId}/manual-hold`)
+      .send({ note: 'Reserve for manual four-color run' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.is_held).toBe(1);
+    expect(res.body.manual_hold).toBe(1);
+    expect(res.body.is_active).toBe(1);
+    expect(scheduler.scheduleForPrinter).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/printers/:id/release-hold', () => {
+  test('releases manual hold and resumes scheduler dispatch', async () => {
+    const scheduler = { scheduleForPrinter: jest.fn() };
+    const releaseApp = express();
+    releaseApp.use(express.json());
+    releaseApp.use('/api/printers', require('../routes/printers')(db, scheduler));
+
+    const printerId = seedPrinter({ name: `Printer_release_hold_${Date.now()}`, status: 'IDLE', is_held: 1, is_active: 1 });
+    db.prepare('UPDATE printers SET manual_hold = 1 WHERE id = ?').run(printerId);
+
+    const res = await request(releaseApp)
+      .post(`/api/printers/${printerId}/release-hold`)
+      .send({ note: 'Manual work complete' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.is_held).toBe(0);
+    expect(res.body.manual_hold).toBe(0);
+    expect(scheduler.scheduleForPrinter).toHaveBeenCalledWith(expect.objectContaining({ id: printerId }));
+  });
+});
 
 describe('POST /api/printers/:id/mark-job-failure', () => {
   test('returns 404 for unknown printer id', async () => {

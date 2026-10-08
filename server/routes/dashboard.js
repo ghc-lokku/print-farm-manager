@@ -86,15 +86,45 @@ module.exports = (db) => {
       ORDER BY parts_printed DESC
     `);
 
+    const projectsColumns = db.prepare('PRAGMA table_info(projects)').all().map(c => c.name);
+    const gcodesColumns = db.prepare('PRAGMA table_info(gcodes)').all().map(c => c.name);
+    const hasProjectRequiredColor = projectsColumns.includes('required_color');
+    const hasGcodeRequiredColor = gcodesColumns.includes('required_color');
+
     const projectsWithParts = activeProjects.map(proj => {
+
       const parts = db.prepare(`
         SELECT parts.*,
           COALESCE((
             SELECT SUM(j.parts_per_plate) FROM jobs j
             WHERE j.part_id = parts.id AND j.status IN ('uploading', 'printing')
-          ), 0) AS active_qty
+          ), 0) AS active_qty,
+          ${hasGcodeRequiredColor ? `
+          COALESCE((
+            SELECT json_group_array(color) FROM (
+              SELECT DISTINCT TRIM(g.required_color) AS color
+              FROM gcodes g
+              WHERE g.part_id = parts.id
+                AND g.required_color IS NOT NULL
+                AND TRIM(g.required_color) != ''
+              ORDER BY color COLLATE NOCASE
+            )
+          ), '[]') AS required_colors_json,
+          COALESCE((
+            SELECT TRIM(g.required_color)
+            FROM gcodes g
+            WHERE g.part_id = parts.id
+              AND g.required_color IS NOT NULL
+              AND TRIM(g.required_color) != ''
+            ORDER BY g.id ASC
+            LIMIT 1
+          ), ${hasProjectRequiredColor ? 'TRIM(?)' : 'NULL'}) AS effective_required_color
+          ` : `
+          '[]' AS required_colors_json,
+          ${hasProjectRequiredColor ? 'TRIM(?)' : 'NULL'} AS effective_required_color
+          `}
         FROM parts WHERE project_id = ? ORDER BY sort_order ASC, created_at ASC
-      `).all(proj.id);
+      `).all(...(hasProjectRequiredColor ? [proj.required_color || null, proj.id] : [proj.id]));
 
       const finishedMs  = elapsedFinishedStmt.get(proj.id).ms;
       const printingMs  = elapsedPrintingStmt.get(now, proj.id).ms;

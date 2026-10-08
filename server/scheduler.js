@@ -2,6 +2,12 @@ const EventEmitter = require('events');
 const fs = require('fs');
 const path = require('path');
 const { getDriver } = require('./drivers');
+const {
+  createPrinterColorMatcher,
+  createPrinterMaterialMatcher,
+  pickBambuAmsSlotForRequiredColor,
+  pickBambuAmsSlotsForRequiredColors,
+} = require('./color-matching');
 const notifications = require('./notifications');
 const events = require('./events');
 
@@ -27,6 +33,10 @@ class JobScheduler extends EventEmitter {
     // Prevents stale failed jobs from a previous session being credited when a
     // Bambu printer transitions OFFLINE → FINISHED on reconnect.
     this.startedAt = 0;
+    const gcodeColumns = this.db.prepare('PRAGMA table_info(gcodes)').all().map((c) => c.name);
+    const projectColumns = this.db.prepare('PRAGMA table_info(projects)').all().map((c) => c.name);
+    this._hasGcodeRequiredBrand = gcodeColumns.includes('required_brand');
+    this._hasProjectRequiredBrand = projectColumns.includes('required_brand');
   }
 
   start() {
@@ -183,6 +193,51 @@ class JobScheduler extends EventEmitter {
     );
   }
 
+  // Dispatch exactly one plate for a specific part as soon as a matching printer is
+  // available. This bypasses normal project/part priority ordering for one reservation
+  // only, then returns to the standard scheduler flow.
+  async queueSinglePlateForPart(partId) {
+    const part = this.db.prepare(`
+      SELECT parts.*, projects.status AS project_status
+      FROM parts
+      JOIN projects ON projects.id = parts.project_id
+      WHERE parts.id = ?
+    `).get(partId);
+    if (!part) return { ok: false, error: 'Part not found', status: 404 };
+    if (part.project_status !== 'active') return { ok: false, error: 'Project must be active to queue a plate', status: 409 };
+    if (part.status !== 'open') return { ok: false, error: 'Part is closed', status: 409 };
+
+    const eligiblePrinters = this.db.prepare(`
+      SELECT * FROM printers
+      WHERE status IN ('IDLE', 'FINISHED', 'STOPPED') AND is_held = 0 AND is_active = 1
+      ORDER BY id ASC
+    `).all();
+
+    if (eligiblePrinters.length === 0) {
+      return { ok: false, error: 'No eligible printers are currently idle', status: 409 };
+    }
+
+    for (const printer of eligiblePrinters) {
+      try {
+        const reservation = this._reserveJob(printer, { preferredPartId: part.id });
+        if (!reservation) continue;
+        const jobId = await this._executeUpload(printer, reservation);
+        if (!jobId) {
+          return { ok: false, error: 'Upload failed, printer held for operator confirmation', status: 409 };
+        }
+        return { ok: true, jobId, printerId: printer.id, printerName: printer.name, partId: part.id };
+      } catch (err) {
+        console.error(`[scheduler] queueSinglePlateForPart failed on ${printer.name}:`, err);
+      }
+    }
+
+    return {
+      ok: false,
+      error: 'No eligible printer matches this plate\'s model, material, color, brand, and group requirements',
+      status: 409,
+    };
+  }
+
   // Poll jobs table until all given job IDs are printing or terminal.
   // A job left as 'uploading' with its printer held counts as terminal — the upload
   // failed and operator confirmation is needed before anything changes. The batch
@@ -231,7 +286,10 @@ class JobScheduler extends EventEmitter {
   // Returns null if nothing was reserved (nothing to wait on, nothing to upload).
   // Returns { jobId, candidate, driver, gcodeFullPath } if a job was created as
   // 'uploading': that INSERT is the dispatch lock; _executeUpload takes it from here.
-  _reserveJob(printer) {
+  _reserveJob(printer, options = {}) {
+    const preferredPartId = Number.isInteger(Number(options.preferredPartId))
+      ? Number(options.preferredPartId)
+      : null;
     // Re-read is_held and status from DB — the printer object passed in may be stale
     const fresh = this.db.prepare('SELECT is_held, status FROM printers WHERE id = ?').get(printer.id);
     if (!fresh || fresh.is_held) {
@@ -310,42 +368,120 @@ class JobScheduler extends EventEmitter {
     let candidate = null;
     let jobId = null;
     let gcodeFullPath = null;
+    const colorMatches = createPrinterColorMatcher(this.db, printer);
+    const materialMatches = createPrinterMaterialMatcher(this.db, printer);
 
     while (true) {
       const excludeClause = skippedPartIds.length > 0
         ? `AND parts.id NOT IN (${skippedPartIds.map(() => '?').join(',')})`
         : '';
+      const preferredClause = preferredPartId != null ? 'AND parts.id = ?' : '';
 
-      candidate = this.db.prepare(`
-        SELECT
-          parts.id          AS part_id,
-          parts.target_qty,
-          parts.completed_qty,
-          parts.project_id,
-          gcodes.id         AS gcode_id,
-          gcodes.filename,
-          gcodes.filepath,
-          gcodes.parts_per_plate,
-          gcodes.ams_slot
-        FROM parts
-        JOIN gcodes   ON gcodes.part_id    = parts.id
-        JOIN projects ON projects.id       = parts.project_id
-        WHERE parts.status    = 'open'
-          AND projects.status = 'active'
-          AND gcodes.printer_model = ?
-          AND (COALESCE(gcodes.allowed_groups, projects.allowed_groups) IS NULL OR EXISTS (
-            SELECT 1 FROM json_each(COALESCE(gcodes.allowed_groups, projects.allowed_groups)) WHERE value = ?
-          ))
-          AND (COALESCE(gcodes.required_material, projects.required_material) IS NULL OR COALESCE(gcodes.required_material, projects.required_material) = ?)
-          AND (COALESCE(gcodes.required_color, projects.required_color) IS NULL OR COALESCE(gcodes.required_color, projects.required_color) = ?)
-          ${excludeClause}
-        ORDER BY projects.priority ASC, projects.created_at ASC, parts.sort_order ASC, parts.created_at ASC
-        LIMIT 1
-      `).get(printer.model, printer.group_name, printer.loaded_material, printer.loaded_color, ...skippedPartIds);
+      const selectCandidate = (modelPredicate, modelParams) => {
+        const requiredBrandExpr = this._hasGcodeRequiredBrand && this._hasProjectRequiredBrand
+          ? 'COALESCE(gcodes.required_brand, projects.required_brand)'
+          : (this._hasGcodeRequiredBrand ? 'gcodes.required_brand' : 'NULL');
+        const params = [
+          ...modelParams,
+          printer.group_name,
+          ...(preferredPartId != null ? [preferredPartId] : []),
+          ...skippedPartIds,
+        ];
+        return this.db.prepare(`
+          SELECT
+            parts.id          AS part_id,
+            parts.target_qty,
+            parts.completed_qty,
+            parts.project_id,
+            gcodes.id         AS gcode_id,
+            gcodes.filename,
+            gcodes.filepath,
+            gcodes.parts_per_plate,
+            gcodes.ams_slot,
+            gcodes.plate_no,
+            gcodes.printer_model,
+            COALESCE(gcodes.required_material, projects.required_material) AS required_material,
+            COALESCE(gcodes.required_color, projects.required_color) AS required_color,
+            ${requiredBrandExpr} AS required_brand
+          FROM parts
+          JOIN (
+            SELECT g.*
+            FROM gcodes g
+            JOIN (
+              SELECT part_id, printer_model, MAX(id) AS max_id
+              FROM gcodes
+              GROUP BY part_id, printer_model
+            ) latest ON latest.max_id = g.id
+          ) gcodes ON gcodes.part_id = parts.id
+          JOIN projects ON projects.id       = parts.project_id
+          WHERE parts.status    = 'open'
+            AND projects.status = 'active'
+            AND ${modelPredicate}
+            AND (COALESCE(gcodes.allowed_groups, projects.allowed_groups) IS NULL OR EXISTS (
+              SELECT 1 FROM json_each(COALESCE(gcodes.allowed_groups, projects.allowed_groups)) WHERE value = ?
+            ))
+            ${preferredClause}
+            ${excludeClause}
+          ORDER BY projects.priority ASC, projects.created_at ASC, parts.sort_order ASC, parts.created_at ASC
+          LIMIT 1
+        `).get(...params);
+      };
+
+      if (printer.type === 'bambu') {
+        // Two-pass model selection for Bambu:
+        // 1) exact model row first
+        // 2) alternate-model fallback only if exact is unavailable
+        candidate = selectCandidate('gcodes.printer_model = ?', [printer.model])
+          || selectCandidate('gcodes.printer_model != ?', [printer.model]);
+      } else {
+        candidate = selectCandidate('gcodes.printer_model = ?', [printer.model]);
+      }
 
       if (!candidate) {
         console.log(`[scheduler] No candidate found for ${printer.name} (model: ${printer.model}) — no open parts with matching G-code in an active project`);
         return null;
+      }
+
+      // Material eligibility is matched in JS so Bambu printers can validate
+      // against live tray telemetry rather than a stale loaded_material field.
+      if (!materialMatches(candidate.required_material)) {
+        skippedPartIds.push(candidate.part_id);
+        continue;
+      }
+
+      // Color eligibility is matched in JS so Bambu printers can satisfy a
+      // required color from any currently loaded AMS slot, not just loaded_color.
+      if (!colorMatches(candidate.required_color, candidate.required_material, candidate.required_brand)) {
+        skippedPartIds.push(candidate.part_id);
+        continue;
+      }
+
+      // For Bambu jobs, prefer the live AMS slots that match the required color(s)
+      // so stale per-gcode ams_slot values do not force the wrong tray selection
+      // at print start. Multi-color plates can declare several required colors via
+      // a comma-separated "Black, White" string; the scheduler keeps them in order
+      // so the same filament index order is used when generating the print payload.
+      const liveAmsSlots = pickBambuAmsSlotsForRequiredColors(
+        this.db,
+        printer,
+        candidate.required_color,
+        candidate.required_material,
+        candidate.required_brand
+      );
+      if (liveAmsSlots.length > 0) {
+        candidate.ams_slots = liveAmsSlots;
+        candidate.ams_slot = liveAmsSlots[0];
+      } else {
+        const liveAmsSlot = pickBambuAmsSlotForRequiredColor(
+          this.db,
+          printer,
+          candidate.required_color,
+          candidate.required_material,
+          candidate.required_brand
+        );
+        if (liveAmsSlot != null) {
+          candidate.ams_slot = liveAmsSlot;
+        }
       }
 
       // Synchronously insert a job as 'uploading' — this acts as a dispatch lock
@@ -426,11 +562,25 @@ class JobScheduler extends EventEmitter {
     try {
       for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
         try {
-          await driver.uploadAndPrint(printer, gcodeFullPath, candidate.filename, { amsSlot: candidate.ams_slot });
+          const amsSlots = Array.isArray(candidate.ams_slots) && candidate.ams_slots.length > 0
+            ? candidate.ams_slots
+            : (candidate.ams_slot != null ? [candidate.ams_slot] : []);
+          await driver.uploadAndPrint(printer, gcodeFullPath, candidate.filename, {
+            amsSlot: candidate.ams_slot,
+            amsSlots,
+            plateNo: candidate.plate_no ?? null,
+          });
           lastErr = null;
           break;
         } catch (err) {
           lastErr = err;
+          const isUnrecoverableFtps = err.code === 'BAMBU_FTPS_SESSION_REUSE';
+          if (isUnrecoverableFtps) {
+            console.error(
+              `[scheduler] ${printer.name} upload failed with unrecoverable FTPS session-reuse error: ${err.message}`
+            );
+            break;
+          }
           if (attempt <= MAX_RETRIES) {
             const isConflict = err.code === 'UPLOAD_CONFLICT';
             const waitMs = isConflict ? 60000 : 5000;
@@ -458,14 +608,17 @@ class JobScheduler extends EventEmitter {
         return jobId;
       }
 
+      const isFtpsReuseError = lastErr.code === 'BAMBU_FTPS_SESSION_REUSE';
+
       // Upload failed and printer is not printing. Hold the printer and leave the job
       // as 'uploading' — the operator must confirm the outcome via Fleet UI.
       // Job Running: confirms the print is actually running (changes job to printing).
       // Upload Failed: marks the job failed and decommissions.
       // Never auto-fail here — the operator decides.
       this.db.prepare('UPDATE printers SET is_held = 1 WHERE id = ?').run(printer.id);
-      notifications.add(
-        `Upload to ${printer.name} failed after ${MAX_RETRIES + 1} attempts — check the printer and confirm the outcome in Fleet.`
+      notifications.add(isFtpsReuseError
+        ? `Upload to ${printer.name} failed: Bambu FTPS server requires TLS session reuse on data channel. Check runtime FTPS support/curl fallback, then confirm outcome in Fleet.`
+        : `Upload to ${printer.name} failed after ${MAX_RETRIES + 1} attempts — check the printer and confirm the outcome in Fleet.`
       );
       console.error(`[scheduler] ${printer.name} upload failed after ${MAX_RETRIES + 1} attempts — held, job ${jobId} left as uploading for operator confirmation`);
       return null;
@@ -620,8 +773,19 @@ class JobScheduler extends EventEmitter {
   // When a held printer transitions to PRINTING, it has recovered from a transient
   // OFFLINE. If it still has a printing job, auto-unhold — no operator action needed.
   _handleRecoveredToPrinting(printer) {
-    const fresh = this.db.prepare('SELECT is_held FROM printers WHERE id = ?').get(printer.id);
+    let fresh;
+    try {
+      fresh = this.db.prepare('SELECT is_held, manual_hold FROM printers WHERE id = ?').get(printer.id);
+    } catch (_) {
+      // Older test schemas may not have manual_hold; treat as not manually held.
+      fresh = this.db.prepare('SELECT is_held, 0 AS manual_hold FROM printers WHERE id = ?').get(printer.id);
+    }
     if (!fresh || !fresh.is_held) return;
+
+    if (fresh.manual_hold) {
+      console.log(`[scheduler] ${printer.name} is on manual hold - skipping auto-unhold after PRINTING recovery`);
+      return;
+    }
 
     const activeJob = this.db.prepare(
       "SELECT id FROM jobs WHERE printer_id = ? AND status = 'printing' LIMIT 1"

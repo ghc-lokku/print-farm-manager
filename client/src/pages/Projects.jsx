@@ -37,16 +37,32 @@ const SHOW_DRAFT_KEY     = 'projects.showDraft';
 const SHOW_PAUSED_KEY    = 'projects.showPaused';
 const SHOW_COMPLETED_KEY = 'projects.showCompleted';
 
+function parseProjectSizeVariant(name) {
+  const raw = String(name || '').trim();
+  const m = raw.match(/^(.*?)(?:\s*-\s*|\s*\()(?:(\d{2,3})\s*(?:%|percent))(?:\))?\s*$/i);
+  if (m) {
+    const base = (m[1] || '').trim();
+    const sizeNum = parseInt(m[2], 10);
+    if (base && Number.isFinite(sizeNum)) {
+      return { baseName: base, sizeLabel: `${sizeNum}%`, sizeRank: sizeNum };
+    }
+  }
+  return { baseName: raw, sizeLabel: '100%', sizeRank: 100 };
+}
+
 // Dropdown options per project status.
 // 'action' is either a status string ('active', 'paused') or a special verb ('complete', 'reactivate').
 const STATUS_MENU = {
   draft:     [{ label: 'Activate',        action: 'active' },
               { label: 'Delete project',  action: 'delete', danger: true }],
   active:    [{ label: 'Pause project',   action: 'paused' },
-              { label: 'Mark complete',   action: 'complete', danger: true }],
+              { label: 'Mark complete',   action: 'complete', danger: true },
+              { label: 'Delete project',  action: 'delete', danger: true }],
   paused:    [{ label: 'Resume project',  action: 'active' },
-              { label: 'Mark complete',   action: 'complete', danger: true }],
-  completed: [{ label: 'Re-activate',     action: 'reactivate' }],
+              { label: 'Mark complete',   action: 'complete', danger: true },
+              { label: 'Delete project',  action: 'delete', danger: true }],
+  completed: [{ label: 'Re-activate',     action: 'reactivate' },
+              { label: 'Delete project',  action: 'delete', danger: true }],
 };
 
 function StatusDropdown({ project, onTransition }) {
@@ -151,7 +167,7 @@ const uploadLabelSx = {
   marginBottom: 3,
 };
 
-function GcodeUploadPanel({ part, onUploaded, filamentTypes, filamentColors, projectMaterial, projectColor, projectGroups, groups }) {
+function GcodeUploadPanel({ part, onUploaded, filamentTypes, filamentColors, filamentBrands, projectMaterial, projectColor, projectBrand, projectGroups, groups }) {
   const [file, setFile]             = useState(null);
   const [partsPerPlate, setPPP]     = useState('');
   const [model, setModel]           = useState('');
@@ -165,6 +181,8 @@ function GcodeUploadPanel({ part, onUploaded, filamentTypes, filamentColors, pro
   const [selectedGroups, setSelectedGroups]   = useState([]);  // [] = all groups (or inherits project)
   const [requiredMaterial, setRequiredMaterial] = useState('');
   const [requiredColor, setRequiredColor]       = useState('');
+  const [requiredBrand, setRequiredBrand]       = useState('');
+  const brandListId = `upload-brand-options-part-${part.id}`;
 
   useEffect(() => {
     fetch('/api/models').then(r => r.json()).then(setModelOptions).catch(() => {});
@@ -236,6 +254,7 @@ function GcodeUploadPanel({ part, onUploaded, filamentTypes, filamentColors, pro
     if (selectedGroups.length > 0) fd.append('allowed_groups', JSON.stringify(selectedGroups));
     if (requiredMaterial.trim()) fd.append('required_material', requiredMaterial.trim());
     if (requiredColor.trim())    fd.append('required_color',    requiredColor.trim());
+    if (requiredBrand.trim())    fd.append('required_brand',    requiredBrand.trim());
 
     try {
       // XHR instead of fetch so we can report upload progress on large files
@@ -258,7 +277,7 @@ function GcodeUploadPanel({ part, onUploaded, filamentTypes, filamentColors, pro
       } else {
         setFile(null); setPPP(''); setModel(''); setAmsSlot(''); setAmsSlots([]);
         setParsedEstPrintSecs(null); setParsedMaterialGrams(null);
-        setSelectedGroups([]); setRequiredMaterial(''); setRequiredColor('');
+        setSelectedGroups([]); setRequiredMaterial(''); setRequiredColor(''); setRequiredBrand('');
         if (fileInputRef.current) fileInputRef.current.value = '';
         onUploaded();
       }
@@ -329,6 +348,16 @@ function GcodeUploadPanel({ part, onUploaded, filamentTypes, filamentColors, pro
             </select>
           </div>
         )}
+        <div style={{ minWidth: 220, flex: 1 }}>
+          <div style={uploadLabelSx}>Required color(s)</div>
+          <input
+            type="text"
+            value={requiredColor}
+            onChange={(e) => setRequiredColor(e.target.value)}
+            placeholder="Black, White"
+            style={{ ...inputSx, width: '100%' }}
+          />
+        </div>
         <button
           onClick={handleUpload}
           disabled={uploading || bambuNeedsThreemf}
@@ -392,6 +421,19 @@ function GcodeUploadPanel({ part, onUploaded, filamentTypes, filamentColors, pro
             </select>
           );
         })()}
+        <input
+          type="text"
+          value={requiredBrand}
+          onChange={e => setRequiredBrand(e.target.value)}
+          list={filamentBrands.length > 0 ? brandListId : undefined}
+          placeholder={projectBrand ? `project: ${projectBrand}` : 'any brand'}
+          style={{ ...inputSx, width: 170, fontSize: 12 }}
+        />
+        {filamentBrands.length > 0 && (
+          <datalist id={brandListId}>
+            {filamentBrands.map((b) => <option key={b} value={b} />)}
+          </datalist>
+        )}
         {groups.length > 0 && (
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
             <span style={{ fontSize: 11, color: '#475569' }}>Groups:</span>
@@ -420,7 +462,46 @@ function GcodeUploadPanel({ part, onUploaded, filamentTypes, filamentColors, pro
   );
 }
 
-function GcodeEstimateRow({ gc, onDelete, onSaved, filamentTypes, filamentColors, projectMaterial, projectColor, projectGroups, groups }) {
+const COLOR_NAME_TO_HEX = {
+  black: '#000000', white: '#FFFFFF', red: '#FF0000', green: '#008000', blue: '#0000FF',
+  yellow: '#FFFF00', orange: '#FFA500', purple: '#800080', pink: '#FFC0CB', brown: '#A52A2A',
+  gray: '#808080', grey: '#808080', silver: '#C0C0C0', cyan: '#00FFFF', magenta: '#FF00FF',
+  teal: '#008080', maroon: '#800000', navy: '#000080', olive: '#808000', lime: '#00FF00',
+  fuchsia: '#FF00FF', aqua: '#00FFFF', tan: '#D2B48C', gold: '#FFD700', beige: '#F5F5DC',
+};
+
+function normalizeHexColor(value) {
+  if (!value || typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const hex = trimmed.replace(/^#/, '').split(',')[0].trim();
+  if (/^[0-9A-Fa-f]{6}$/.test(hex)) return `#${hex.toUpperCase()}`;
+  return null;
+}
+
+function resolveColorSwatches(value, filamentColors = []) {
+  if (!value) return [];
+  const swatches = [];
+  const seen = new Set();
+  const candidates = String(value).split(',').map(s => s.trim()).filter(Boolean);
+  for (const candidate of candidates) {
+    let color = normalizeHexColor(candidate);
+    if (!color) {
+      const match = filamentColors.find(c => c?.name && c.name.toLowerCase() === candidate.toLowerCase());
+      color = match?.hex_color ? normalizeHexColor(match.hex_color) : null;
+    }
+    if (!color) {
+      color = COLOR_NAME_TO_HEX[candidate.toLowerCase()] || null;
+    }
+    if (color && !seen.has(color)) {
+      seen.add(color);
+      swatches.push(color);
+    }
+  }
+  return swatches;
+}
+
+function GcodeEstimateRow({ gc, onDelete, onSaved, filamentTypes, filamentColors, filamentBrands, projectMaterial, projectColor, projectBrand, projectGroups, groups }) {
   const [timeDraft, setTimeDraft]         = useState(formatDurationForInput(gc.est_print_secs));
   const [materialDraft, setMaterialDraft] = useState(formatMaterialForInput(gc.material_grams));
   const [parsing, setParsing]             = useState(false);
@@ -431,14 +512,16 @@ function GcodeEstimateRow({ gc, onDelete, onSaved, filamentTypes, filamentColors
   });
   const [reqMaterial, setReqMaterial] = useState(gc.required_material || '');
   const [reqColor, setReqColor]       = useState(gc.required_color || '');
-
+  const [reqBrand, setReqBrand]       = useState(gc.required_brand || '');
+  const brandListId = `gcode-brand-options-${gc.id}`;
   useEffect(() => {
     setTimeDraft(formatDurationForInput(gc.est_print_secs));
     setMaterialDraft(formatMaterialForInput(gc.material_grams));
     setReqMaterial(gc.required_material || '');
     setReqColor(gc.required_color || '');
+    setReqBrand(gc.required_brand || '');
     try { setSelectedGroups(gc.allowed_groups ? JSON.parse(gc.allowed_groups) : []); } catch (_) { setSelectedGroups([]); }
-  }, [gc.est_print_secs, gc.material_grams, gc.required_material, gc.required_color, gc.allowed_groups]);
+  }, [gc.est_print_secs, gc.material_grams, gc.required_material, gc.required_color, gc.required_brand, gc.allowed_groups]);
 
   function toggleGroup(g) {
     setSelectedGroups(prev => prev.includes(g) ? prev.filter(x => x !== g) : [...prev, g]);
@@ -477,6 +560,7 @@ function GcodeEstimateRow({ gc, onDelete, onSaved, filamentTypes, filamentColors
         allowed_groups:   selectedGroups.length > 0 ? JSON.stringify(selectedGroups) : null,
         required_material: reqMaterial.trim() || null,
         required_color:    reqColor.trim()    || null,
+        required_brand:    reqBrand.trim()    || null,
       }),
     });
     setSaving(false);
@@ -577,21 +661,52 @@ function GcodeEstimateRow({ gc, onDelete, onSaved, filamentTypes, filamentColors
         ) : (
           <span style={{ fontSize: 11, color: '#334155', fontStyle: 'italic' }}>No materials in library</span>
         )}
-        {(() => {
-          const effectiveMat = reqMaterial || projectMaterial;
-          const colorOptions = filamentColors.filter(c => c.type_name === effectiveMat);
-          if (!effectiveMat || colorOptions.length === 0) return null;
-          return (
-            <select
-              value={reqColor}
-              onChange={e => setReqColor(e.target.value)}
-              style={{ ...inputSx, width: 160, fontSize: 12 }}
-            >
-              <option value="">{projectColor ? `— project: ${projectColor} —` : '— any color —'}</option>
-              {colorOptions.map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
-            </select>
-          );
-        })()}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <input
+            type="text"
+            value={reqColor}
+            onChange={e => setReqColor(e.target.value)}
+            placeholder={projectColor ? `project: ${projectColor} or Black, White` : 'Black, White'}
+            style={{ ...inputSx, width: 180, fontSize: 12 }}
+          />
+          {(() => {
+            const swatches = resolveColorSwatches(reqColor || projectColor || '', filamentColors);
+            if (swatches.length === 0) return null;
+            return (
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                {swatches.map((swatch, idx) => (
+                  <span
+                    key={`${swatch}-${idx}`}
+                    title={swatch}
+                    style={{
+                      display: 'inline-block',
+                      width: 12,
+                      height: 12,
+                      borderRadius: 2,
+                      background: swatch,
+                      border: '1px solid #2d3748',
+                      boxShadow: '0 0 0 1px rgba(15, 23, 42, 0.5)',
+                      verticalAlign: 'middle',
+                    }}
+                  />
+                ))}
+              </div>
+            );
+          })()}
+        </div>
+        <input
+          type="text"
+          value={reqBrand}
+          onChange={e => setReqBrand(e.target.value)}
+          list={filamentBrands.length > 0 ? brandListId : undefined}
+          placeholder={projectBrand ? `project: ${projectBrand}` : 'any brand'}
+          style={{ ...inputSx, width: 170, fontSize: 12 }}
+        />
+        {filamentBrands.length > 0 && (
+          <datalist id={brandListId}>
+            {filamentBrands.map((b) => <option key={b} value={b} />)}
+          </datalist>
+        )}
         {groups.length > 0 && (
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
             <span style={{ fontSize: 11, color: '#475569' }}>Groups:</span>
@@ -620,15 +735,19 @@ function GcodeEstimateRow({ gc, onDelete, onSaved, filamentTypes, filamentColors
   );
 }
 
-function PartDetailsPanel({ part, gcodes, onRefresh, onSaved, onConfirm, filamentTypes, filamentColors, projectMaterial, projectColor, projectGroups, groups }) {
+function PartDetailsPanel({ part, gcodes, onRefresh, onSaved, onConfirm, onQueueOne, filamentTypes, filamentColors, filamentBrands, projectMaterial, projectColor, projectBrand, projectGroups, groups }) {
   const [have, setHave] = useState(String(part.completed_qty));
   const [need, setNeed] = useState(String(part.target_qty));
   const [saving, setSaving] = useState(false);
   const [qtyError, setQtyError] = useState(null);
+  const [plateBrand, setPlateBrand] = useState('');
+  const [plateBrandSaving, setPlateBrandSaving] = useState(false);
+  const [plateBrandError, setPlateBrandError] = useState(null);
 
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft]     = useState('');
   const nameEscapedRef = useRef(false);
+  const [previewUnavailable, setPreviewUnavailable] = useState(false);
 
   // Dispatch diagnostic — "why isn't this printing?"
   const [dispatchCheck, setDispatchCheck] = useState(null);
@@ -649,7 +768,20 @@ function PartDetailsPanel({ part, gcodes, onRefresh, onSaved, onConfirm, filamen
   useEffect(() => {
     setHave(String(part.completed_qty));
     setNeed(String(part.target_qty));
+    setPreviewUnavailable(false);
   }, [part.completed_qty, part.target_qty]);
+
+  useEffect(() => {
+    const brands = [...new Set(
+      gcodes
+        .map((g) => String(g.required_brand || '').trim())
+        .filter(Boolean)
+    )];
+    setPlateBrand(brands.length === 1 ? brands[0] : '');
+    setPlateBrandError(null);
+  }, [gcodes]);
+
+  const previewGcode = gcodes.find((g) => String(g.filename || '').toLowerCase().endsWith('.3mf')) || null;
 
   async function saveName() {
     if (nameEscapedRef.current) { nameEscapedRef.current = false; return; }
@@ -707,6 +839,32 @@ function PartDetailsPanel({ part, gcodes, onRefresh, onSaved, onConfirm, filamen
     }
   }
 
+  async function applyPlateBrand() {
+    if (gcodes.length === 0) return;
+    setPlateBrandSaving(true);
+    setPlateBrandError(null);
+    try {
+      const value = plateBrand.trim() || null;
+      for (const gc of gcodes) {
+        const res = await fetch(`/api/gcodes/${gc.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ required_brand: value }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error || `Failed to update brand for ${gc.filename}`);
+        }
+      }
+      onRefresh();
+      onSaved?.('Plate brand updated');
+    } catch (err) {
+      setPlateBrandError(err.message || 'Failed to update plate brand');
+    } finally {
+      setPlateBrandSaving(false);
+    }
+  }
+
   async function deleteGcode(gcodeId) {
     const ok = await onConfirm({
       title: 'Delete G-code',
@@ -729,69 +887,136 @@ function PartDetailsPanel({ part, gcodes, onRefresh, onSaved, onConfirm, filamen
 
       {/* Part name */}
       <div>
-        <div style={sectionLabel}>Part Name</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          {editingName ? (
-            <input
-              type="text"
-              value={nameDraft}
-              onChange={e => setNameDraft(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Enter') saveName();
-                if (e.key === 'Escape') { nameEscapedRef.current = true; setEditingName(false); }
-              }}
-              onBlur={saveName}
-              autoFocus
-              style={{ ...inputSx, fontSize: 14, fontWeight: 600, width: 220 }}
-            />
-          ) : (
-            <>
-              <span style={{ fontSize: 14, fontWeight: 600, color: '#e2e8f0' }}>{part.name}</span>
-              <button
-                onClick={() => { nameEscapedRef.current = false; setNameDraft(part.name); setEditingName(true); }}
-                title="Rename part"
-                style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: 13, padding: '0 2px', lineHeight: 1 }}
-              >✎</button>
-            </>
-          )}
-        </div>
-      </div>
+        <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start' }}>
+          <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div>
+              <div style={sectionLabel}>Part Name</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {editingName ? (
+                  <input
+                    type="text"
+                    value={nameDraft}
+                    onChange={e => setNameDraft(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') saveName();
+                      if (e.key === 'Escape') { nameEscapedRef.current = true; setEditingName(false); }
+                    }}
+                    onBlur={saveName}
+                    autoFocus
+                    style={{ ...inputSx, fontSize: 14, fontWeight: 600, width: 220 }}
+                  />
+                ) : (
+                  <>
+                    <span style={{ fontSize: 14, fontWeight: 600, color: '#e2e8f0' }}>{part.name}</span>
+                    <button
+                      onClick={() => { nameEscapedRef.current = false; setNameDraft(part.name); setEditingName(true); }}
+                      title="Rename part"
+                      style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: 13, padding: '0 2px', lineHeight: 1 }}
+                    >✎</button>
+                  </>
+                )}
+              </div>
+            </div>
 
-      {/* Quantities */}
-      <div>
-        <div style={sectionLabel}>Quantities</div>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'flex-end', flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <label style={{ color: '#64748b', fontSize: 12 }}>Have (completed)</label>
-            <input
-              type="number" min={0} value={have}
-              onChange={e => setHave(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && saveQtys()}
-              style={{ ...inputSx, width: 90 }}
-            />
+            <div>
+              <div style={sectionLabel}>Quantities</div>
+              <div style={{ display: 'flex', gap: 12, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ color: '#64748b', fontSize: 12 }}>Have (completed)</label>
+                  <input
+                    type="number" min={0} value={have}
+                    onChange={e => setHave(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && saveQtys()}
+                    style={{ ...inputSx, width: 90 }}
+                  />
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ color: '#64748b', fontSize: 12 }}>Need (target)</label>
+                  <input
+                    type="number" min={1} value={need}
+                    onChange={e => setNeed(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && saveQtys()}
+                    style={{ ...inputSx, width: 90 }}
+                  />
+                </div>
+                <button
+                  onClick={saveQtys}
+                  disabled={saving}
+                  style={{
+                    background: '#1d4ed8', color: '#fff', border: 'none', borderRadius: 4,
+                    padding: '5px 14px', fontSize: 12, fontWeight: 600,
+                    cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1,
+                  }}
+                >
+                  {saving ? 'Saving…' : 'Save'}
+                </button>
+                <button
+                  onClick={() => onQueueOne?.(part)}
+                  style={{
+                    background: '#0f3f8c', color: '#dbeafe', border: '1px solid #1e40af', borderRadius: 4,
+                    padding: '5px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                  }}
+                >
+                  Queue 1 Plate
+                </button>
+              </div>
+              {qtyError && <p style={{ color: '#f87171', fontSize: 12, margin: '6px 0 0' }}>{qtyError}</p>}
+            </div>
+
+            <div>
+              <div style={sectionLabel}>Plate Filament Targeting</div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                {filamentBrands.length > 0 ? (
+                  <select
+                    value={plateBrand}
+                    onChange={(e) => setPlateBrand(e.target.value)}
+                    style={{ ...inputSx, width: 220 }}
+                    disabled={gcodes.length === 0 || plateBrandSaving}
+                  >
+                    <option value="">- any brand -</option>
+                    {filamentBrands.map((b) => <option key={b} value={b}>{b}</option>)}
+                  </select>
+                ) : (
+                  <span style={{ fontSize: 12, color: '#64748b' }}>No filament brands in library yet.</span>
+                )}
+                <button
+                  onClick={applyPlateBrand}
+                  disabled={gcodes.length === 0 || plateBrandSaving || filamentBrands.length === 0}
+                  style={{
+                    background: '#1d4ed8', color: '#fff', border: 'none', borderRadius: 4,
+                    padding: '5px 12px', fontSize: 12, fontWeight: 600,
+                    cursor: (gcodes.length === 0 || plateBrandSaving || filamentBrands.length === 0) ? 'not-allowed' : 'pointer',
+                    opacity: (gcodes.length === 0 || plateBrandSaving || filamentBrands.length === 0) ? 0.7 : 1,
+                  }}
+                >
+                  {plateBrandSaving ? 'Applying…' : 'Apply to Plate'}
+                </button>
+              </div>
+              {plateBrandError && <p style={{ color: '#f87171', fontSize: 12, margin: '6px 0 0' }}>{plateBrandError}</p>}
+              {gcodes.length > 0 && (
+                <p style={{ color: '#64748b', fontSize: 11, margin: '6px 0 0' }}>
+                  Updates brand targeting on every G-code row for this plate.
+                </p>
+              )}
+            </div>
           </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <label style={{ color: '#64748b', fontSize: 12 }}>Need (target)</label>
-            <input
-              type="number" min={1} value={need}
-              onChange={e => setNeed(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && saveQtys()}
-              style={{ ...inputSx, width: 90 }}
-            />
+          <div style={{ background: '#0b1220', border: '1px solid #1f2937', borderRadius: 6, minHeight: 120, padding: 8, width: 300, marginLeft: 'auto', flexShrink: 0 }}>
+            {previewGcode && !previewUnavailable ? (
+              <img
+                src={`/api/gcodes/${previewGcode.id}/preview`}
+                alt={`Plate preview for ${part.name}`}
+                onError={() => setPreviewUnavailable(true)}
+                style={{ width: '100%', maxHeight: 180, objectFit: 'contain', display: 'block' }}
+              />
+            ) : (
+              <div style={{ color: '#fbbf24', fontSize: 11, lineHeight: 1.4 }}>
+                {previewGcode
+                  ? 'No embedded plate preview found in this 3MF file.'
+                  : 'No 3MF file is attached to this part yet.'}
+              </div>
+            )}
           </div>
-          <button
-            onClick={saveQtys}
-            disabled={saving}
-            style={{
-              background: '#1d4ed8', color: '#fff', border: 'none', borderRadius: 4,
-              padding: '5px 14px', fontSize: 12, fontWeight: 600,
-              cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1,
-            }}
-          >
-            {saving ? 'Saving…' : 'Save'}
-          </button>
         </div>
-        {qtyError && <p style={{ color: '#f87171', fontSize: 12, margin: '6px 0 0' }}>{qtyError}</p>}
       </div>
 
       {/* G-code files with per-gcode estimates */}
@@ -809,8 +1034,10 @@ function PartDetailsPanel({ part, gcodes, onRefresh, onSaved, onConfirm, filamen
               onSaved={onSaved}
               filamentTypes={filamentTypes}
               filamentColors={filamentColors}
+              filamentBrands={filamentBrands}
               projectMaterial={projectMaterial}
               projectColor={projectColor}
+              projectBrand={projectBrand}
               projectGroups={projectGroups}
               groups={groups}
             />
@@ -826,8 +1053,10 @@ function PartDetailsPanel({ part, gcodes, onRefresh, onSaved, onConfirm, filamen
           onUploaded={onRefresh}
           filamentTypes={filamentTypes}
           filamentColors={filamentColors}
+          filamentBrands={filamentBrands}
           projectMaterial={projectMaterial}
           projectColor={projectColor}
+          projectBrand={projectBrand}
           projectGroups={projectGroups}
           groups={groups}
         />
@@ -878,6 +1107,9 @@ export default function Projects() {
   const [confirm, confirmModal]           = useConfirm();
   const [projects, setProjects]           = useState([]);
   const [loading, setLoading]             = useState(true);
+  const [projectSearch, setProjectSearch] = useState('');
+  const [groupSizeVariants, setGroupSizeVariants] = useState(true);
+  const [collapsedVariantGroups, setCollapsedVariantGroups] = useState({});
 
   // List filters: only Active shows by default (see SHOW_*_KEY above)
   const [showDraft, setShowDraft] = useState(() => {
@@ -908,6 +1140,8 @@ export default function Projects() {
   const [newPartName, setNewPartName]     = useState('');
   const [newPartQty, setNewPartQty]       = useState('');
   const [addingPart, setAddingPart]       = useState(false);
+  const [bulkTargetQty, setBulkTargetQty] = useState('1');
+  const [bulkAddingQty, setBulkAddingQty] = useState(false);
 
   // Details panels (set of open part IDs)
   const [openPanels, setOpenPanels]       = useState(new Set());
@@ -930,12 +1164,17 @@ export default function Projects() {
   // never needs to re-fetch when a gcode's target model changes.
   const [filamentTypes,  setFilamentTypes]  = useState([]);
   const [filamentColors, setFilamentColors] = useState([]);
+  const [filamentBrands, setFilamentBrands] = useState([]);
   const [allGroups,      setAllGroups]      = useState([]);
+  const [allProjectTags, setAllProjectTags] = useState([]);
+  const didApplyUrlHintRef = useRef(false);
 
   useEffect(() => {
     fetch('/api/filaments/types').then(r => r.json()).then(setFilamentTypes).catch(() => {});
     fetch('/api/filaments/colors').then(r => r.json()).then(setFilamentColors).catch(() => {});
+    fetch('/api/filaments/brands').then(r => r.json()).then(setFilamentBrands).catch(() => {});
     fetch('/api/groups').then(r => r.json()).then(groups => setAllGroups(groups.map(g => g.name))).catch(() => {});
+    fetch('/api/project-tags').then(r => r.json()).then(setAllProjectTags).catch(() => {});
   }, []);
 
   function toggleShowDraft(v)     { setShowDraft(v);     localStorage.setItem(SHOW_DRAFT_KEY, JSON.stringify(v)); }
@@ -959,6 +1198,34 @@ export default function Projects() {
   }, []);
 
   useEffect(() => { fetchProjects(); }, [fetchProjects]);
+
+  useEffect(() => {
+    if (didApplyUrlHintRef.current) return;
+    const params = new URLSearchParams(window.location.search || '');
+    const revealHidden = params.get('revealHidden') === '1';
+    const focusProjectRaw = params.get('focusProject');
+    const focusProjectId = Number.parseInt(focusProjectRaw || '', 10);
+
+    let touched = false;
+    if (revealHidden) {
+      toggleShowDraft(true);
+      toggleShowPaused(true);
+      toggleShowCompleted(true);
+      touched = true;
+    }
+
+    if (Number.isInteger(focusProjectId) && focusProjectId > 0) {
+      setSelectedId(focusProjectId);
+      touched = true;
+    }
+
+    if (touched) {
+      const base = window.location.pathname || '/projects';
+      window.history.replaceState({}, document.title, base);
+    }
+
+    didApplyUrlHintRef.current = true;
+  }, []);
 
   const fetchDetail = useCallback(async (projectId) => {
     const [projRes, partsRes] = await Promise.all([
@@ -1104,15 +1371,16 @@ export default function Projects() {
       });
       if (!ok) return;
 
-      const res  = await fetch(`/api/projects/${id}/reactivate`, { method: 'POST' });
-      const data = await res.json();
-
-      if (data.nothing_to_reopen) {
-        showToast('All parts are at target qty — adjust quantities first.', 'warning');
+      const res = await fetch(`/api/projects/${id}/reactivate`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(`Re-activate failed: ${data.error || res.status}`, 'error');
         return;
       }
 
+      fetch('/api/scheduler/dispatch', { method: 'POST' }).catch(() => {});
       await Promise.all([fetchDetail(id), fetchProjects()]);
+      showToast('Project reset and queued for the next run');
       return;
     }
 
@@ -1195,6 +1463,58 @@ export default function Projects() {
     showToast('Part added');
   }
 
+  async function setTargetQtyForAllParts() {
+    const targetQty = parseInt(bulkTargetQty, 10);
+    if (isNaN(targetQty) || targetQty < 1) {
+      showToast('Target qty must be 1 or greater', 'error');
+      return;
+    }
+    if (parts.length === 0) {
+      showToast('Project has no parts to update', 'warning');
+      return;
+    }
+
+    const reopenCount = parts.filter(p => p.status === 'closed' && p.completed_qty < targetQty).length;
+    const closeCount = parts.filter(p => p.status === 'open' && p.completed_qty >= targetQty).length;
+    const reactivateHint = detailProject?.status === 'completed' && reopenCount > 0
+      ? '\n\nThis will also re-activate the completed project so dispatch can resume.'
+      : '';
+
+    const ok = await confirm({
+      title: `Set all plates to target ${targetQty}?`,
+      message: `This sets target qty to ${targetQty} for all ${parts.length} part(s).` +
+        (reopenCount > 0 ? `\n${reopenCount} closed part(s) will reopen.` : '') +
+        (closeCount > 0 ? `\n${closeCount} open part(s) will close.` : '') +
+        reactivateHint,
+      confirmLabel: 'Set Target',
+    });
+    if (!ok) return;
+
+    setBulkAddingQty(true);
+    const res = await fetch(`/api/projects/${selectedId}/set-target-all`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_qty: targetQty }),
+    });
+    setBulkAddingQty(false);
+
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showToast(body.error || 'Bulk qty update failed.', 'error');
+      return;
+    }
+
+    await Promise.all([fetchDetail(selectedId), fetchProjects()]);
+    const reopened = body.reopened_parts || 0;
+    const closed = body.closed_parts || 0;
+    showToast(
+      (reopened > 0 || closed > 0)
+        ? `Set all parts to ${targetQty}. ${reopened} reopened, ${closed} closed.`
+        : `Set all parts to ${targetQty}.`,
+      'success'
+    );
+  }
+
   function togglePanel(partId) {
     setOpenPanels(prev => {
       const next = new Set(prev);
@@ -1208,11 +1528,11 @@ export default function Projects() {
     setOpenPanels(new Set());
   }
 
-  async function saveProjectFilament(material, color) {
+  async function saveProjectFilament(material, color, brand) {
     await fetch(`/api/projects/${detailProject.id}/filament`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ required_material: material, required_color: color }),
+      body: JSON.stringify({ required_material: material, required_color: color, required_brand: brand }),
     });
     await fetchDetail(detailProject.id);
   }
@@ -1224,6 +1544,21 @@ export default function Projects() {
       body: JSON.stringify({ allowed_groups: groups }),
     });
     await fetchDetail(detailProject.id);
+  }
+
+  async function saveProjectTags(tagIds) {
+    const res = await fetch(`/api/projects/${detailProject.id}/tags`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tag_ids: tagIds }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showToast(`Save failed: ${data.error || res.status}`, 'error');
+      return;
+    }
+    setDetailProject(data);
+    fetchProjects();
   }
 
   async function saveProjectName() {
@@ -1240,18 +1575,115 @@ export default function Projects() {
     showToast('Saved');
   }
 
+  async function queueProjectVariant(project) {
+    if (!project) return;
+    try {
+      if (project.status === 'completed') {
+        const res = await fetch(`/api/projects/${project.id}/reactivate`, { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showToast(`Queue failed: ${data.error || res.status}`, 'error');
+          return;
+        }
+        fetch('/api/scheduler/dispatch', { method: 'POST' }).catch(() => {});
+      } else if (project.status !== 'active') {
+        const res = await fetch(`/api/projects/${project.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'active' }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showToast(`Queue failed: ${data.error || res.status}`, 'error');
+          return;
+        }
+      }
+
+      fetch('/api/scheduler/dispatch', { method: 'POST' }).catch(() => {});
+      await fetchProjects();
+      showToast(`Queued ${project.name}`);
+    } catch (err) {
+      showToast(`Queue failed: ${err.message}`, 'error');
+    }
+  }
+
+  async function queueSinglePlate(part) {
+    if (!part) return;
+    try {
+      const res = await fetch(`/api/parts/${part.id}/queue-one`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(`Queue failed: ${data.error || res.status}`, 'error');
+        return;
+      }
+      showToast(`Queued one plate for ${part.name} on ${data.printerName || 'a matching printer'}`);
+      await fetchDetail(selectedId);
+    } catch (err) {
+      showToast(`Queue failed: ${err.message}`, 'error');
+    }
+  }
+
+  function toggleVariantGroupCollapsed(groupKey) {
+    setCollapsedVariantGroups(prev => {
+      const current = prev[groupKey] ?? true;
+      return { ...prev, [groupKey]: !current };
+    });
+  }
+
 
   // ─── List view ───────────────────────────────────────────────────────────────
   if (selectedId == null) {
     const draftCount     = projects.filter(p => p.status === 'draft').length;
     const pausedCount    = projects.filter(p => p.status === 'paused').length;
     const completedCount = projects.filter(p => p.status === 'completed').length;
+    const searchNeedle = projectSearch.trim().toLowerCase();
     const visibleProjects = projects.filter(p =>
-      p.status === 'active' ||
-      (p.status === 'draft'     && showDraft) ||
-      (p.status === 'paused'    && showPaused) ||
-      (p.status === 'completed' && showCompleted)
+      (
+        p.status === 'active' ||
+        (p.status === 'draft'     && showDraft) ||
+        (p.status === 'paused'    && showPaused) ||
+        (p.status === 'completed' && showCompleted)
+      ) &&
+      (
+        !searchNeedle ||
+        String(p.name || '').toLowerCase().includes(searchNeedle) ||
+        (Array.isArray(p.tags) && p.tags.some(t => String(t.name || '').toLowerCase().includes(searchNeedle)))
+      )
     );
+
+    const groupedProjects = (() => {
+      const groups = new Map();
+      for (const p of visibleProjects) {
+        const parsedFromName = parseProjectSizeVariant(p.name);
+        const familyName = String(p.family_name || parsedFromName.baseName || p.name || '').trim();
+        const sizeLabel = String(p.size_label || parsedFromName.sizeLabel || '100%').trim();
+        const sizeRank = Number.isFinite(Number(p.size_rank)) ? Number(p.size_rank) : parsedFromName.sizeRank;
+        const key = familyName.toLowerCase();
+        if (!groups.has(key)) {
+          groups.set(key, { groupKey: key, baseName: familyName, items: [] });
+        }
+        groups.get(key).items.push({
+          ...p,
+          variantSizeLabel: sizeLabel,
+          variantSizeRank: sizeRank,
+        });
+      }
+
+      return [...groups.values()]
+        .map(g => ({
+          ...g,
+          items: g.items.sort((a, b) => {
+            if (b.variantSizeRank !== a.variantSizeRank) return b.variantSizeRank - a.variantSizeRank;
+            return a.priority - b.priority;
+          }),
+        }))
+        .sort((a, b) => {
+          const ap = Math.min(...a.items.map(x => x.priority));
+          const bp = Math.min(...b.items.map(x => x.priority));
+          if (ap !== bp) return ap - bp;
+          return a.baseName.localeCompare(b.baseName);
+        });
+    })();
 
     return (
       <div>
@@ -1359,6 +1791,23 @@ export default function Projects() {
           </div>
         )}
 
+        <div style={{ marginBottom: 16 }}>
+          <input
+            type="text"
+            value={projectSearch}
+            onChange={(e) => setProjectSearch(e.target.value)}
+            placeholder="Search by project name or tag"
+            style={{ ...inputSx, width: 320 }}
+          />
+        </div>
+
+        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 12 }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#94a3b8', cursor: 'pointer' }}>
+            <input type="checkbox" checked={groupSizeVariants} onChange={e => setGroupSizeVariants(e.target.checked)} style={{ accentColor: '#3b82f6' }} />
+            Group size variants
+          </label>
+        </div>
+
         {showNewForm && (
           <div style={{ background: '#1e2433', border: '1px solid #2d3748', borderRadius: 8, padding: 16, marginBottom: 16, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -1422,7 +1871,122 @@ export default function Projects() {
         )}
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {visibleProjects.map(p => {
+          {groupSizeVariants ? groupedProjects.map(group => {
+            const statuses = new Set(group.items.map(i => i.status));
+            const mixed = statuses.size > 1;
+            const collapsed = collapsedVariantGroups[group.groupKey] ?? true;
+            return (
+              <div
+                key={`group-${group.baseName}`}
+                style={{
+                  background: '#1e2433',
+                  border: '1px solid #2d3748',
+                  borderRadius: 8,
+                  padding: '12px 16px',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 10,
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                  <button
+                    onClick={() => toggleVariantGroupCollapsed(group.groupKey)}
+                    style={{
+                      minWidth: 0,
+                      background: 'none',
+                      border: 'none',
+                      padding: 0,
+                      margin: 0,
+                      textAlign: 'left',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <div style={{ fontWeight: 700, fontSize: 15, color: '#e2e8f0' }}>{group.baseName}</div>
+                    <div style={{ color: '#64748b', fontSize: 12 }}>
+                      {group.items.length} size variant{group.items.length === 1 ? '' : 's'} {collapsed ? '(collapsed)' : '(expanded)'}
+                    </div>
+                  </button>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    {mixed && <span style={{ color: '#fbbf24', fontSize: 11 }}>Mixed statuses</span>}
+                    <button
+                      onClick={() => toggleVariantGroupCollapsed(group.groupKey)}
+                      title={collapsed ? 'Expand sizes' : 'Collapse sizes'}
+                      style={{
+                        background: '#0f172a',
+                        color: '#cbd5e1',
+                        border: '1px solid #334155',
+                        borderRadius: 4,
+                        padding: '2px 8px',
+                        fontSize: 12,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {collapsed ? '▸' : '▾'}
+                    </button>
+                  </div>
+                </div>
+
+                {!collapsed && <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {group.items.map(p => {
+                    const s = PROJECT_STATUS[p.status] || PROJECT_STATUS.draft;
+                    return (
+                      <div key={p.id} style={{
+                        background: '#172033',
+                        border: '1px solid #2a3348',
+                        borderRadius: 6,
+                        padding: '8px 10px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: 10,
+                        flexWrap: 'wrap',
+                      }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                          <span style={{
+                            background: '#0f172a',
+                            border: '1px solid #334155',
+                            borderRadius: 999,
+                            color: '#cbd5e1',
+                            fontSize: 11,
+                            padding: '1px 8px',
+                            fontWeight: 700,
+                          }}>{p.variantSizeLabel}</span>
+                          <span style={{ background: s.bg, color: s.text, border: `1px solid ${s.text}40`, borderRadius: 4, padding: '2px 8px', fontSize: 11, fontWeight: 700 }}>
+                            {s.label}
+                          </span>
+                          {Array.isArray(p.tags) && p.tags.length > 0 && (
+                            <span style={{ color: '#64748b', fontSize: 11 }}>
+                              {p.tags.map(t => t.name).join(', ')}
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                          <button
+                            onClick={() => queueProjectVariant(p)}
+                            style={{
+                              background: '#1d4ed8', color: '#fff', border: 'none', borderRadius: 4,
+                              padding: '4px 10px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                            }}
+                          >
+                            Queue
+                          </button>
+                          <button
+                            onClick={() => setSelectedId(p.id)}
+                            style={{
+                              background: '#1f2937', color: '#cbd5e1', border: '1px solid #334155', borderRadius: 4,
+                              padding: '4px 10px', fontSize: 12, cursor: 'pointer',
+                            }}
+                          >
+                            Open
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>}
+              </div>
+            );
+          }) : visibleProjects.map(p => {
             const s = PROJECT_STATUS[p.status] || PROJECT_STATUS.draft;
             const isDragging = projectDragSrc === p.id;
             const isOver     = projectDragOver === p.id && !isDragging;
@@ -1458,6 +2022,25 @@ export default function Projects() {
                   </div>
                   {p.description && (
                     <div style={{ color: '#64748b', fontSize: 12 }}>{p.description}</div>
+                  )}
+                  {Array.isArray(p.tags) && p.tags.length > 0 && (
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+                      {p.tags.map((tag) => (
+                        <span
+                          key={tag.id}
+                          style={{
+                            background: '#0f172a',
+                            border: '1px solid #334155',
+                            borderRadius: 999,
+                            color: '#94a3b8',
+                            fontSize: 11,
+                            padding: '1px 8px',
+                          }}
+                        >
+                          {tag.name}
+                        </span>
+                      ))}
+                    </div>
                   )}
                 </div>
 
@@ -1496,6 +2079,7 @@ export default function Projects() {
 
   let projectGroups = [];
   try { projectGroups = detailProject.allowed_groups ? JSON.parse(detailProject.allowed_groups) : []; } catch (_) {}
+  const selectedTagIds = Array.isArray(detailProject.tags) ? detailProject.tags.map(t => t.id) : [];
 
   return (
     <div>
@@ -1543,7 +2127,7 @@ export default function Projects() {
             value={detailProject.required_material || ''}
             onChange={e => {
               const mat = e.target.value;
-              saveProjectFilament(mat, '');
+              saveProjectFilament(mat, '', detailProject.required_brand || '');
             }}
             style={{ ...inputSx, fontSize: 12, width: 160 }}
           >
@@ -1552,7 +2136,7 @@ export default function Projects() {
           </select>
           <select
             value={detailProject.required_color || ''}
-            onChange={e => saveProjectFilament(detailProject.required_material, e.target.value)}
+            onChange={e => saveProjectFilament(detailProject.required_material, e.target.value, detailProject.required_brand || '')}
             disabled={!detailProject.required_material}
             style={{ ...inputSx, fontSize: 12, width: 160 }}
           >
@@ -1561,7 +2145,20 @@ export default function Projects() {
               .filter(c => c.type_name === detailProject.required_material)
               .map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
           </select>
-          {(detailProject.required_material || detailProject.required_color) && (
+          <input
+            type="text"
+            value={detailProject.required_brand || ''}
+            onChange={e => saveProjectFilament(detailProject.required_material, detailProject.required_color, e.target.value)}
+            list={filamentBrands.length > 0 ? 'project-brand-options' : undefined}
+            placeholder="any brand"
+            style={{ ...inputSx, fontSize: 12, width: 170 }}
+          />
+          {filamentBrands.length > 0 && (
+            <datalist id="project-brand-options">
+              {filamentBrands.map((b) => <option key={b} value={b} />)}
+            </datalist>
+          )}
+          {(detailProject.required_material || detailProject.required_color || detailProject.required_brand) && (
             <span style={{ fontSize: 11, color: '#475569', fontStyle: 'italic' }}>
               applies to all gcodes in this project unless overridden per-gcode
             </span>
@@ -1595,6 +2192,30 @@ export default function Projects() {
               applies to all gcodes in this project unless overridden per-gcode
             </span>
           )}
+        </div>
+      )}
+
+      {/* Project tags */}
+      {allProjectTags.length > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 12, color: '#64748b', flexShrink: 0 }}>Tags:</span>
+          {allProjectTags.map(tag => (
+            <label key={tag.id} style={{ display: 'flex', alignItems: 'center', gap: 3, cursor: 'pointer', fontSize: 12, color: selectedTagIds.includes(tag.id) ? '#7dd3fc' : '#64748b' }}>
+              <input
+                type="checkbox"
+                checked={selectedTagIds.includes(tag.id)}
+                onChange={() => {
+                  const next = selectedTagIds.includes(tag.id)
+                    ? selectedTagIds.filter(x => x !== tag.id)
+                    : [...selectedTagIds, tag.id];
+                  saveProjectTags(next);
+                }}
+                style={{ accentColor: '#3b82f6' }}
+              />
+              {tag.name}
+            </label>
+          ))}
+          {selectedTagIds.length === 0 && <span style={{ fontSize: 11, color: '#334155', fontStyle: 'italic' }}>no tags</span>}
         </div>
       )}
 
@@ -1709,6 +2330,17 @@ export default function Projects() {
 
               {/* Details toggle */}
               <button
+                onClick={() => queueSinglePlate(part)}
+                style={{
+                  background: '#0f3f8c', color: '#dbeafe', border: '1px solid #1e40af',
+                  borderRadius: 4, padding: '4px 10px', fontSize: 12, cursor: 'pointer', flexShrink: 0,
+                }}
+              >
+                Queue 1
+              </button>
+
+              {/* Details toggle */}
+              <button
                 onClick={() => togglePanel(part.id)}
                 style={{
                   background: panelOpen ? '#1e3a5f' : '#1f2937',
@@ -1745,10 +2377,13 @@ export default function Projects() {
                 onRefresh={() => { fetchDetail(selectedId); fetchProjects(); }}
                 onSaved={showToast}
                 onConfirm={confirm}
+                onQueueOne={queueSinglePlate}
                 filamentTypes={filamentTypes}
                 filamentColors={filamentColors}
+                filamentBrands={filamentBrands}
                 projectMaterial={detailProject.required_material || ''}
                 projectColor={detailProject.required_color || ''}
+                projectBrand={detailProject.required_brand || ''}
                 projectGroups={projectGroups}
                 groups={allGroups}
               />
@@ -1797,6 +2432,38 @@ export default function Projects() {
             }}
           >
             Add Part
+          </button>
+        </div>
+      </div>
+
+      {/* Bulk quantity update */}
+      <div style={{ background: '#1e2433', border: '1px solid #2d3748', borderRadius: 8, padding: 16, marginTop: 8 }}>
+        <h3 style={{ fontSize: 13, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 10 }}>
+          Set Target For All Plates
+        </h3>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <label style={{ color: '#64748b', fontSize: 12 }}>Target qty *</label>
+            <input
+              type="number"
+              min={1}
+              value={bulkTargetQty}
+              onChange={(e) => setBulkTargetQty(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && setTargetQtyForAllParts()}
+              style={{ ...inputSx, width: 100 }}
+            />
+          </div>
+          <button
+            onClick={setTargetQtyForAllParts}
+            disabled={bulkAddingQty || parts.length === 0}
+            style={{
+              background: '#1d4ed8', color: '#fff', border: 'none', borderRadius: 4,
+              padding: '6px 14px', fontSize: 13, fontWeight: 600,
+              cursor: bulkAddingQty || parts.length === 0 ? 'not-allowed' : 'pointer',
+              opacity: bulkAddingQty || parts.length === 0 ? 0.7 : 1,
+            }}
+          >
+            {bulkAddingQty ? 'Applying…' : 'Set All Targets'}
           </button>
         </div>
       </div>

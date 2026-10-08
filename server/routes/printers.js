@@ -2,7 +2,6 @@ const express = require('express');
 const multer = require('multer');
 const Papa = require('papaparse');
 const axios = require('axios');
-const router = express.Router();
 const events = require('../events');
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -31,7 +30,8 @@ function resolveModel(rawModel, name) {
   return normalizeModel(rawModel) || inferModel(name);
 }
 
-module.exports = (db) => {
+module.exports = (db, scheduler = null) => {
+  const router = express.Router();
   // Silently keeps the printer_groups registry a superset of every group name
   // ever assigned to a printer, so a group can never again vanish from a
   // picker just because no printer currently carries it. Zero added friction:
@@ -107,6 +107,20 @@ module.exports = (db) => {
     res.json(slots || []);
   });
 
+  // GET /api/printers/:id/ams — returns live AMS slot list for one Bambu printer.
+  // Used by Printer Detail so operators can verify the exact loaded slot colors
+  // on this machine (not "any printer of this model"). Non-Bambu or inactive
+  // printers return [] by design.
+  router.get('/:id/ams', (req, res) => {
+    const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id);
+    if (!printer) return res.status(404).json({ error: 'Printer not found' });
+    if (printer.type !== 'bambu' || printer.is_active !== 1) return res.json([]);
+
+    const { getAmsSlots } = require('../drivers/bambu');
+    const slots = getAmsSlots(printer);
+    res.json(slots || []);
+  });
+
   // GET /api/printers/:id
   router.get('/:id', (req, res) => {
     const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id);
@@ -153,7 +167,7 @@ module.exports = (db) => {
     const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id);
     if (!printer) return res.status(404).json({ error: 'Printer not found' });
 
-    const { name, ip, api_key, serial_number, group_name, type, model, is_held, decommission_note, loaded_material, loaded_color } = req.body;
+    const { name, ip, api_key, serial_number, group_name, type, model, is_held, manual_hold, decommission_note, loaded_material, loaded_color } = req.body;
     let normalized = undefined;
     if (model !== undefined) {
       normalized = normalizeModel(model);
@@ -185,22 +199,46 @@ module.exports = (db) => {
     };
 
     try {
-      db.prepare(`
-        UPDATE printers
-        SET name = COALESCE(?, name),
-            ip = COALESCE(?, ip),
-            api_key = COALESCE(?, api_key),
-            serial_number = COALESCE(?, serial_number),
-            group_name = COALESCE(?, group_name),
-            type = COALESCE(?, type),
-            model = COALESCE(?, model),
-            is_held = COALESCE(?, is_held),
-            decommission_note = COALESCE(?, decommission_note),
-            loaded_material = ?,
-            loaded_color = ?
-        WHERE id = ?
-      `).run(name, ip, api_key, serial_number, group_name, type, normalized, is_held, decommission_note ?? null,
-             newMaterial, newColor, req.params.id);
+      try {
+        db.prepare(`
+          UPDATE printers
+          SET name = COALESCE(?, name),
+              ip = COALESCE(?, ip),
+              api_key = COALESCE(?, api_key),
+              serial_number = COALESCE(?, serial_number),
+              group_name = COALESCE(?, group_name),
+              type = COALESCE(?, type),
+              model = COALESCE(?, model),
+              is_held = COALESCE(?, is_held),
+              manual_hold = COALESCE(?, manual_hold),
+              decommission_note = COALESCE(?, decommission_note),
+              loaded_material = ?,
+              loaded_color = ?
+          WHERE id = ?
+        `).run(name, ip, api_key, serial_number, group_name, type, normalized, is_held, manual_hold,
+               decommission_note ?? null, newMaterial, newColor, req.params.id);
+      } catch (err) {
+        if (!String(err.message || '').includes('manual_hold')) throw err;
+
+        // Backward-compatible path for legacy test schemas that do not include
+        // manual_hold yet.
+        db.prepare(`
+          UPDATE printers
+          SET name = COALESCE(?, name),
+              ip = COALESCE(?, ip),
+              api_key = COALESCE(?, api_key),
+              serial_number = COALESCE(?, serial_number),
+              group_name = COALESCE(?, group_name),
+              type = COALESCE(?, type),
+              model = COALESCE(?, model),
+              is_held = COALESCE(?, is_held),
+              decommission_note = COALESCE(?, decommission_note),
+              loaded_material = ?,
+              loaded_color = ?
+          WHERE id = ?
+        `).run(name, ip, api_key, serial_number, group_name, type, normalized, is_held,
+               decommission_note ?? null, newMaterial, newColor, req.params.id);
+      }
 
       // Best-effort convenience: a failure here must never turn an already-
       // committed printer update into a reported error.
@@ -233,6 +271,79 @@ module.exports = (db) => {
     if (!printer) return res.status(404).json({ error: 'Printer not found' });
     db.prepare('DELETE FROM printers WHERE id = ?').run(req.params.id);
     res.json({ success: true });
+  });
+
+  // POST /api/printers/:id/clear-stopped — return a stopped printer to service
+  // without decommissioning it. This is the safe recovery path for a Bambu printer
+  // that latched STOPPED after an operator stop but is otherwise healthy.
+  router.post('/:id/clear-stopped', (req, res) => {
+    const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id);
+    if (!printer) return res.status(404).json({ error: 'Printer not found' });
+
+    // If a stale active job row survived (for example when STOPPED was latched but
+    // the scheduler did not see the transition), cancel it so this recovery path can
+    // actually return the machine to dispatch.
+    const activeJob = db.prepare(`
+      SELECT * FROM jobs
+      WHERE printer_id = ? AND status IN ('uploading', 'printing')
+      ORDER BY COALESCE(started_at, created_at) DESC
+      LIMIT 1
+    `).get(printer.id);
+    if (activeJob) {
+      db.prepare("UPDATE jobs SET status = 'cancelled', finished_at = ? WHERE id = ?")
+        .run(Date.now(), activeJob.id);
+      events.insert(printer.id, 'job_cancelled', `Job ${activeJob.id} cancelled during stopped-state recovery`);
+      console.log(`[printers] ${printer.name} stopped-state recovery cancelled lingering active job ${activeJob.id}`);
+    }
+
+    db.prepare('UPDATE printers SET is_held = 0, manual_hold = 0 WHERE id = ?').run(printer.id);
+    events.insert(printer.id, 'resume', req.body?.note ?? 'Printer resumed from stopped state');
+
+    const updated = db.prepare('SELECT * FROM printers WHERE id = ?').get(printer.id);
+    if (scheduler && typeof scheduler.scheduleForPrinter === 'function') {
+      scheduler.scheduleForPrinter(updated);
+    }
+
+    console.log(`[printers] ${printer.name} recovered from STOPPED state — back online without decommission`);
+    res.json(updated);
+  });
+
+  // POST /api/printers/:id/manual-hold - reserve this printer for manual work.
+  // If the printer is currently printing, the current job continues but the
+  // machine stays out of future dispatch until the operator releases the hold.
+  router.post('/:id/manual-hold', (req, res) => {
+    const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id);
+    if (!printer) return res.status(404).json({ error: 'Printer not found' });
+    if (printer.is_active === 0) {
+      return res.status(409).json({ error: 'Cannot hold a decommissioned printer' });
+    }
+
+    db.prepare('UPDATE printers SET is_held = 1, manual_hold = 1 WHERE id = ?').run(printer.id);
+    events.insert(printer.id, 'manual_hold', req.body?.note ?? 'Printer manually held for non-queued work');
+    const updated = db.prepare('SELECT * FROM printers WHERE id = ?').get(printer.id);
+    console.log(`[printers] ${printer.name} manually held by operator`);
+    res.json(updated);
+  });
+
+  // POST /api/printers/:id/release-hold - clear operator hold and return printer
+  // to normal dispatch flow.
+  router.post('/:id/release-hold', (req, res) => {
+    const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id);
+    if (!printer) return res.status(404).json({ error: 'Printer not found' });
+    if (printer.is_active === 0) {
+      return res.status(409).json({ error: 'Cannot release hold on a decommissioned printer' });
+    }
+
+    db.prepare('UPDATE printers SET is_held = 0, manual_hold = 0 WHERE id = ?').run(printer.id);
+    events.insert(printer.id, 'manual_hold_released', req.body?.note ?? 'Manual hold released by operator');
+
+    const updated = db.prepare('SELECT * FROM printers WHERE id = ?').get(printer.id);
+    if (scheduler && typeof scheduler.scheduleForPrinter === 'function') {
+      scheduler.scheduleForPrinter(updated);
+    }
+
+    console.log(`[printers] ${printer.name} manual hold released`);
+    res.json(updated);
   });
 
   // POST /api/printers/:id/decommission — remove from active duty

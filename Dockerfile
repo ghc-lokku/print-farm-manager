@@ -8,7 +8,7 @@
 FROM node:22-bookworm-slim AS deps
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 make g++ \
+    python3 make g++ curl \
     && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 COPY patches ./patches
@@ -31,6 +31,10 @@ RUN npm run build
 FROM node:22-bookworm-slim AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY package.json ./
 COPY --from=server-deps /app/node_modules ./node_modules

@@ -7,6 +7,9 @@ const request  = require('supertest');
 const express  = require('express');
 const Database = require('better-sqlite3');
 
+const mockGetAmsSlots = jest.fn();
+jest.mock('../drivers/bambu', () => ({ getAmsSlots: (...args) => mockGetAmsSlots(...args) }));
+
 let db;
 let app;
 
@@ -80,6 +83,11 @@ beforeAll(() => {
   app = express();
   app.use(express.json());
   app.use('/api/printers', require('../routes/printers')(db));
+});
+
+beforeEach(() => {
+  mockGetAmsSlots.mockReset();
+  mockGetAmsSlots.mockReturnValue(null);
 });
 
 // ── GET /api/printers/filaments ───────────────────────────────────────────────
@@ -212,6 +220,57 @@ describe('PUT /api/printers/:id — material and color', () => {
     expect(res.status).toBe(200);
     expect(res.body.loaded_material).toBe('TPU');
     expect(res.body.loaded_color).toBe('Orange');
+  });
+});
+
+// ── GET /api/printers/:id/ams ───────────────────────────────────────────────
+
+describe('GET /api/printers/:id/ams', () => {
+  test('404 when printer does not exist', async () => {
+    const res = await request(app).get('/api/printers/999999/ams');
+    expect(res.status).toBe(404);
+    expect(res.body.error).toMatch(/not found/i);
+  });
+
+  test('returns [] for non-Bambu printers', async () => {
+    const res = await request(app).get('/api/printers/1/ams');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+    expect(mockGetAmsSlots).not.toHaveBeenCalled();
+  });
+
+  test('returns [] for inactive Bambu printers', async () => {
+    const row = db.prepare(`
+      INSERT INTO printers (name, ip, api_key, group_name, model, type, is_active, serial_number, created_at)
+      VALUES ('BambuOff', '192.168.1.200', 'k', 'Rack B', 'mk4s', 'bambu', 0, 'SN-OFF', ?)
+    `).run(Date.now());
+
+    const res = await request(app).get(`/api/printers/${row.lastInsertRowid}/ams`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+    expect(mockGetAmsSlots).not.toHaveBeenCalled();
+  });
+
+  test('returns live AMS slots for active Bambu printers', async () => {
+    const row = db.prepare(`
+      INSERT INTO printers (name, ip, api_key, group_name, model, type, is_active, serial_number, created_at)
+      VALUES ('BambuOn', '192.168.1.201', 'k', 'Rack B', 'mk4s', 'bambu', 1, 'SN-ON', ?)
+    `).run(Date.now());
+
+    mockGetAmsSlots.mockReturnValue([
+      { slot: 0, type: 'PLA', color: '000000FF' },
+      { slot: 1, type: 'PLA', color: '00FF00FF' },
+      { slot: -1, type: 'PETG', color: 'FF0000FF' },
+    ]);
+
+    const res = await request(app).get(`/api/printers/${row.lastInsertRowid}/ams`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([
+      { slot: 0, type: 'PLA', color: '000000FF' },
+      { slot: 1, type: 'PLA', color: '00FF00FF' },
+      { slot: -1, type: 'PETG', color: 'FF0000FF' },
+    ]);
+    expect(mockGetAmsSlots).toHaveBeenCalledTimes(1);
   });
 });
 

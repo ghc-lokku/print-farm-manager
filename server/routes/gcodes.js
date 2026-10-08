@@ -2,6 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const { openThreeMf } = require('../parse-3mf');
 const router = express.Router();
 
 const GCODE_DIR = path.join(__dirname, '..', 'gcode');
@@ -90,9 +91,57 @@ function normalizeMaterialGrams(raw) {
   return null;
 }
 
+function findPlatePreview(mf, plateNo = null) {
+  if (!mf) return null;
+  const names = mf.names || [];
+
+  const orderedCandidates = [];
+  if (plateNo != null) {
+    orderedCandidates.push(
+      `Metadata/plate_${plateNo}.png`,
+      `Metadata/plate_${plateNo}.jpg`,
+      `Metadata/plate_${plateNo}.jpeg`,
+      `Metadata/plate_${plateNo}.webp`
+    );
+  }
+
+  orderedCandidates.push(
+    'Metadata/thumbnail.png',
+    'Metadata/thumbnail.jpg',
+    'Metadata/thumbnail.jpeg',
+    '3D/Thumbnail.png',
+    '3D/thumbnail.png'
+  );
+
+  for (const name of orderedCandidates) {
+    const exact = names.find((n) => n.toLowerCase() === name.toLowerCase());
+    if (exact) return exact;
+  }
+
+  const generic = names.find((n) => /(?:thumbnail|preview|plate_\d+)\.(?:png|jpe?g|webp)$/i.test(n));
+  return generic || null;
+}
+
+function contentTypeForName(name) {
+  const lower = String(name || '').toLowerCase();
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  return 'application/octet-stream';
+}
+
 // scheduler is optional, only needed at runtime for sweepIdlePrinters after an upload
 // makes a part schedulable. Tests pass null so there is no live scheduler dependency.
 module.exports = (db, scheduler = null) => {
+  const gcodeColumns = (() => {
+    try {
+      return db.prepare('PRAGMA table_info(gcodes)').all().map((c) => c.name);
+    } catch (_) {
+      return [];
+    }
+  })();
+  const hasRequiredBrand = gcodeColumns.includes('required_brand');
+
   // GET /api/gcodes — list, optionally filtered by part_id
   router.get('/', (req, res) => {
     const { part_id } = req.query;
@@ -114,6 +163,34 @@ module.exports = (db, scheduler = null) => {
     res.json({ parse_failed: false, ...parsed, material_grams });
   });
 
+  // GET /api/gcodes/:id/preview - return embedded 3MF plate preview image when available.
+  router.get('/:id/preview', (req, res) => {
+    const gcode = db.prepare('SELECT * FROM gcodes WHERE id = ?').get(req.params.id);
+    if (!gcode) return res.status(404).json({ error: 'G-code not found' });
+
+    const basename = gcode.filepath.split(/[\\/]/).pop();
+    const fullPath = path.join(GCODE_DIR, basename);
+    if (!fs.existsSync(fullPath)) return res.status(404).json({ error: 'G-code file missing' });
+
+    const ext = path.extname(gcode.filename || fullPath).toLowerCase();
+    if (ext !== '.3mf') return res.status(404).json({ error: 'Preview is available only for 3MF files' });
+
+    const mf = openThreeMf(fullPath);
+    if (!mf || typeof mf.extractBytes !== 'function') {
+      return res.status(404).json({ error: 'No preview image found' });
+    }
+
+    const previewEntry = findPlatePreview(mf, gcode.plate_no ?? null);
+    if (!previewEntry) return res.status(404).json({ error: 'No preview image found' });
+
+    const bytes = mf.extractBytes(previewEntry);
+    if (!bytes) return res.status(404).json({ error: 'No preview image found' });
+
+    res.setHeader('Content-Type', contentTypeForName(previewEntry));
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.send(bytes);
+  });
+
   // POST /api/gcodes/upload — upload G-code file and create DB record
   router.post('/upload', async (req, res) => {
     try {
@@ -124,8 +201,8 @@ module.exports = (db, scheduler = null) => {
 
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-    const { part_id, parts_per_plate, printer_model, est_print_secs, ams_slot, material_grams,
-            allowed_groups, required_material, required_color } = req.body;
+        const { part_id, parts_per_plate, printer_model, est_print_secs, ams_slot, material_grams,
+          allowed_groups, required_material, required_color, required_brand } = req.body;
 
     if (!part_id || !parts_per_plate || !printer_model) {
       fs.unlinkSync(req.file.path);
@@ -155,25 +232,47 @@ module.exports = (db, scheduler = null) => {
     // allowed_groups: JSON array string e.g. '["MK4S Farm","XL Farm"]', or null = all groups
     const parsedAllowedGroups = allowed_groups && allowed_groups !== '' ? allowed_groups : null;
     const parsedRequiredMaterial = required_material && required_material !== '' ? required_material.trim() : null;
-    const parsedRequiredColor    = required_color    && required_color    !== '' ? required_color.trim()    : null;
+    const parsedRequiredColor = required_color && required_color !== ''
+      ? String(required_color).split(/[\n,|]/).map(v => v.trim()).filter(Boolean).join(', ')
+      : null;
+    const parsedRequiredBrand = required_brand && required_brand !== '' ? String(required_brand).trim() : null;
 
-    const gcode = db.prepare(`
-      INSERT INTO gcodes (part_id, printer_model, filename, filepath, parts_per_plate, est_print_secs, material_grams, ams_slot, allowed_groups, required_material, required_color, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      part_id,
-      printer_model,
-      req.file.originalname,
-      req.file.filename,
-      parseInt(parts_per_plate, 10),
-      est_print_secs ? parseInt(est_print_secs, 10) : null,
-      parsedMaterialGrams,
-      parsedAmsSlot,
-      parsedAllowedGroups,
-      parsedRequiredMaterial,
-      parsedRequiredColor,
-      Date.now()
-    );
+    const gcode = hasRequiredBrand
+      ? db.prepare(`
+          INSERT INTO gcodes (part_id, printer_model, filename, filepath, parts_per_plate, est_print_secs, material_grams, ams_slot, allowed_groups, required_material, required_color, required_brand, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          part_id,
+          printer_model,
+          req.file.originalname,
+          req.file.filename,
+          parseInt(parts_per_plate, 10),
+          est_print_secs ? parseInt(est_print_secs, 10) : null,
+          parsedMaterialGrams,
+          parsedAmsSlot,
+          parsedAllowedGroups,
+          parsedRequiredMaterial,
+          parsedRequiredColor,
+          parsedRequiredBrand,
+          Date.now()
+        )
+      : db.prepare(`
+          INSERT INTO gcodes (part_id, printer_model, filename, filepath, parts_per_plate, est_print_secs, material_grams, ams_slot, allowed_groups, required_material, required_color, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          part_id,
+          printer_model,
+          req.file.originalname,
+          req.file.filename,
+          parseInt(parts_per_plate, 10),
+          est_print_secs ? parseInt(est_print_secs, 10) : null,
+          parsedMaterialGrams,
+          parsedAmsSlot,
+          parsedAllowedGroups,
+          parsedRequiredMaterial,
+          parsedRequiredColor,
+          Date.now()
+        );
 
     // A part only becomes a real dispatch candidate once it has a matching G-code: the
     // scheduler's candidate query joins on gcodes. Sweep now so an idle printer picks up
@@ -219,9 +318,15 @@ module.exports = (db, scheduler = null) => {
     const allowedGroups      = 'allowed_groups'      in req.body ? (req.body.allowed_groups      || null) : gcode.allowed_groups;
     const requiredMaterial   = 'required_material'   in req.body ? (req.body.required_material   || null) : gcode.required_material;
     const requiredColor      = 'required_color'      in req.body ? (req.body.required_color       || null) : gcode.required_color;
+    const requiredBrand      = 'required_brand'      in req.body ? (req.body.required_brand       || null) : gcode.required_brand;
 
-    db.prepare('UPDATE gcodes SET est_print_secs = ?, material_grams = ?, allowed_groups = ?, required_material = ?, required_color = ? WHERE id = ?')
-      .run(estPrintSecs, materialGrams, allowedGroups, requiredMaterial, requiredColor, req.params.id);
+    if (hasRequiredBrand) {
+      db.prepare('UPDATE gcodes SET est_print_secs = ?, material_grams = ?, allowed_groups = ?, required_material = ?, required_color = ?, required_brand = ? WHERE id = ?')
+        .run(estPrintSecs, materialGrams, allowedGroups, requiredMaterial, requiredColor, requiredBrand, req.params.id);
+    } else {
+      db.prepare('UPDATE gcodes SET est_print_secs = ?, material_grams = ?, allowed_groups = ?, required_material = ?, required_color = ? WHERE id = ?')
+        .run(estPrintSecs, materialGrams, allowedGroups, requiredMaterial, requiredColor, req.params.id);
+    }
 
     res.json(db.prepare('SELECT * FROM gcodes WHERE id = ?').get(req.params.id));
   });

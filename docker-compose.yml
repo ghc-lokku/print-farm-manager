@@ -7,15 +7,14 @@ services:
     container_name: print-farm-manager
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "80:3000"
     volumes:
       - farm-data:/app/server/data
       - farm-gcode:/app/server/gcode
 
   # Development — hot reload for both server and client, no local Node.js
   # install required. Behind the `dev` profile so a bare `docker compose up`
-  # (production) never starts this. Run it on its own — not alongside
-  # production, which would fight over host port 3000 — by naming the service
+  # (production) never starts this. Start it by naming the service
   # explicitly: `docker compose up --build print-farm-manager-dev`. Naming a
   # service starts only that service (and its dependencies), regardless of its
   # profile, instead of "every service enabled for this invocation" the way a

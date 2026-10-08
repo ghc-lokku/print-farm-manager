@@ -9,12 +9,15 @@ const Database = require('better-sqlite3');
 
 let db;
 let app;
+let mockGetAmsSlots;
 
 beforeEach(() => {
+  mockGetAmsSlots = jest.fn(() => null);
   db = new Database(':memory:');
   db.exec(`
     CREATE TABLE printers (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT DEFAULT 'prusa',
       model TEXT NOT NULL, group_name TEXT, loaded_material TEXT, loaded_color TEXT,
       status TEXT DEFAULT 'IDLE', is_held INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1
     );
@@ -41,6 +44,17 @@ beforeEach(() => {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       part_id INTEGER NOT NULL, status TEXT DEFAULT 'queued', parts_per_plate INTEGER NOT NULL
     );
+    CREATE TABLE filament_types (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE
+    );
+    CREATE TABLE filament_colors (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      hex_color TEXT,
+      UNIQUE(type_id, name)
+    );
   `);
 
   // routes/parts.js declares its Express router at module scope, like every route
@@ -49,6 +63,7 @@ beforeEach(() => {
   // test's beforeEach. jest.resetModules() forces a fresh module (and router)
   // each time. See the identical note in backup-restore.test.js.
   jest.resetModules();
+  jest.doMock('../drivers/bambu', () => ({ getAmsSlots: mockGetAmsSlots }));
   app = express();
   app.use(express.json());
   app.use('/api/parts', require('../routes/parts')(db));
@@ -88,13 +103,21 @@ function seedGcode(partId, overrides = {}) {
 
 function seedPrinter(overrides = {}) {
   db.prepare(`
-    INSERT INTO printers (model, group_name, loaded_material, loaded_color, status, is_held, is_active)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO printers (type, model, group_name, loaded_material, loaded_color, status, is_held, is_active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
+    overrides.type ?? 'prusa',
     overrides.model ?? 'mk4s', overrides.group_name ?? null,
     overrides.loaded_material ?? null, overrides.loaded_color ?? null,
     overrides.status ?? 'IDLE', overrides.is_held ?? 0, overrides.is_active ?? 1,
   );
+}
+
+function seedFilamentColor(typeName, colorName, hexColor) {
+  db.prepare('INSERT OR IGNORE INTO filament_types (name) VALUES (?)').run(typeName);
+  const typeId = db.prepare('SELECT id FROM filament_types WHERE name = ?').get(typeName).id;
+  db.prepare('INSERT INTO filament_colors (type_id, name, hex_color) VALUES (?, ?, ?)')
+    .run(typeId, colorName, hexColor);
 }
 
 describe('GET /api/parts/:id/dispatch-status', () => {
@@ -180,5 +203,85 @@ describe('GET /api/parts/:id/dispatch-status', () => {
     expect(res.status).toBe(200);
     expect(res.body.dispatchable).toBe(false);
     expect(res.body.reasons.join(' ')).toContain('Rack A');
+  });
+
+  test('dispatchable when Bambu AMS tray color matches required_color via filament library hex', async () => {
+    const projectId = seedProject();
+    const partId = seedPart(projectId);
+    seedGcode(partId, { printer_model: 'x1c', required_color: 'Black' });
+    seedPrinter({ type: 'bambu', model: 'x1c', loaded_color: null });
+    seedFilamentColor('PLA', 'Black', '#000000');
+    mockGetAmsSlots.mockReturnValue([{ slot: 1, type: 'PLA', color: '000000FF' }]);
+
+    const res = await request(app).get(`/api/parts/${partId}/dispatch-status`);
+    expect(res.status).toBe(200);
+    expect(res.body.dispatchable).toBe(true);
+    expect(res.body.reasons).toEqual([]);
+  });
+
+  test('does not report blocked alternate model rows when another model row is dispatchable', async () => {
+    const projectId = seedProject();
+    const partId = seedPart(projectId);
+    seedGcode(partId, { printer_model: 'p2s', required_color: 'Yellow', required_material: 'PLA' });
+    seedGcode(partId, { printer_model: 'x1c', required_color: 'Yellow', required_material: 'PLA' });
+
+    seedFilamentColor('PLA', 'Yellow', '#FFFF00');
+    seedPrinter({ type: 'bambu', model: 'x1c', loaded_material: 'PLA', loaded_color: null });
+    mockGetAmsSlots.mockReturnValue([{ slot: 2, type: 'PLA', color: 'FFFF00FF' }]);
+
+    const res = await request(app).get(`/api/parts/${partId}/dispatch-status`);
+    expect(res.status).toBe(200);
+    expect(res.body.dispatchable).toBe(true);
+    expect(res.body.reasons).toEqual([]);
+    expect(res.body.notes).toEqual([]);
+  });
+
+  test('ignores absent alternate model blockers when a reachable model exists but is currently busy', async () => {
+    const projectId = seedProject();
+    const partId = seedPart(projectId);
+    seedGcode(partId, { printer_model: 'p2s', required_color: 'Yellow', required_material: 'PLA' });
+    seedGcode(partId, { printer_model: 'x1c', required_color: 'Yellow', required_material: 'PLA' });
+
+    seedFilamentColor('PLA', 'Yellow', '#FFFF00');
+    seedPrinter({ type: 'bambu', model: 'x1c', loaded_material: 'PLA', loaded_color: null, status: 'PRINTING', is_held: 0 });
+    mockGetAmsSlots.mockReturnValue([{ slot: 2, type: 'PLA', color: 'FFFF00FF' }]);
+
+    const res = await request(app).get(`/api/parts/${partId}/dispatch-status`);
+    expect(res.status).toBe(200);
+    expect(res.body.dispatchable).toBe(false);
+    expect(res.body.reasons.join(' ')).toMatch(/matching printer\(s\) are busy/i);
+    expect(res.body.reasons.join(' ')).not.toMatch(/p2s/i);
+  });
+
+  test('reports color mismatch when Bambu has no matching AMS tray color', async () => {
+    const projectId = seedProject();
+    const partId = seedPart(projectId);
+    seedGcode(partId, { printer_model: 'x1c', required_color: 'Black' });
+    seedPrinter({ type: 'bambu', model: 'x1c', loaded_color: null });
+    seedFilamentColor('PLA', 'Green', '#00FF00');
+    mockGetAmsSlots.mockReturnValue([{ slot: 1, type: 'PLA', color: '00FF00FF' }]);
+
+    const res = await request(app).get(`/api/parts/${partId}/dispatch-status`);
+    expect(res.status).toBe(200);
+    expect(res.body.dispatchable).toBe(false);
+    expect(res.body.reasons.join(' ')).toMatch(/Black available/i);
+    expect(res.body.reasons.join(' ')).toMatch(/AMS slot/i);
+  });
+
+  test('uses the newest gcode row when duplicate model rows exist', async () => {
+    const projectId = seedProject();
+    const partId = seedPart(projectId);
+
+    // Legacy duplicate row (older): no color restriction.
+    seedGcode(partId, { printer_model: 'mk4s', required_color: null });
+    // Current row (newer): requires Black.
+    seedGcode(partId, { printer_model: 'mk4s', required_color: 'Black' });
+
+    seedPrinter({ model: 'mk4s', loaded_color: 'White' });
+
+    const res = await request(app).get(`/api/parts/${partId}/dispatch-status`);
+    expect(res.status).toBe(200);
+    expect(res.body.dispatchable).toBe(false);
+    expect(res.body.reasons.join(' ')).toMatch(/Black/i);
   });
 });
