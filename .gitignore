@@ -10,3 +10,9 @@ dist/
 *.docx
 server/data/backups/
 .handoff/
+
+# macOS/SMB transient delete artifacts on external/network volumes
+.smb
+.smb*
+**/.smb
+**/.smb*

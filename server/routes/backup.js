@@ -2,6 +2,7 @@ const express = require('express');
 const multer  = require('multer');
 const path    = require('path');
 const fs      = require('fs');
+const partLedger = require('../partLedger');
 
 const router   = express.Router();
 const GCODE_DIR = path.join(__dirname, '..', 'gcode');
@@ -72,11 +73,10 @@ module.exports = (db) => {
     const printer_models  = db.prepare('SELECT * FROM printer_models').all();
     const printer_groups  = db.prepare('SELECT * FROM printer_groups').all();
     const filament_types  = db.prepare('SELECT * FROM filament_types').all();
-    const filament_brands = db.prepare('SELECT * FROM filament_brands').all();
     const filament_colors = db.prepare('SELECT * FROM filament_colors').all();
-    const project_tags    = db.prepare('SELECT * FROM project_tags').all();
-    const project_tag_links = db.prepare('SELECT * FROM project_tag_links').all();
     const settings        = db.prepare('SELECT * FROM settings').all();
+    partLedger.ensureSchema(db);
+    const part_qty_ledger = db.prepare('SELECT * FROM part_qty_ledger').all();
 
     // Embed gcode files as base64, keyed by their on-disk basename
     const gcodeFiles = {};
@@ -99,11 +99,9 @@ module.exports = (db) => {
       printer_models,
       printer_groups,
       filament_types,
-      filament_brands,
       filament_colors,
-      project_tags,
-      project_tag_links,
       settings,
+      part_qty_ledger,
       gcode_files: gcodeFiles,
     };
 
@@ -151,31 +149,23 @@ module.exports = (db) => {
       const hasPrinterModels  = Array.isArray(backup.printer_models);
       const hasPrinterGroups  = Array.isArray(backup.printer_groups);
       const hasFilamentTypes  = Array.isArray(backup.filament_types);
-      const hasFilamentBrands = Array.isArray(backup.filament_brands);
       const hasFilamentColors = Array.isArray(backup.filament_colors);
-      const hasProjectTags    = Array.isArray(backup.project_tags);
-      const hasProjectTagLinks = Array.isArray(backup.project_tag_links);
       const hasSettings       = Array.isArray(backup.settings);
 
-      const preservedProjectTagLinks = !hasProjectTagLinks
-        ? db.prepare('SELECT * FROM project_tag_links').all()
-        : [];
-      const preservedProjectTags = !hasProjectTags
-        ? db.prepare('SELECT * FROM project_tags').all()
-        : [];
+      partLedger.ensureSchema(db);
 
       const restore = db.transaction(() => {
-        // Delete in FK dependency order
+        // Delete in FK dependency order. The part ledger is always cleared: its rows
+        // describe the parts being replaced. Ledger rows in the backup are restored
+        // below; parts from an older backup without them are rebuilt after the insert.
+        db.prepare('DELETE FROM part_qty_ledger').run();
         db.prepare('DELETE FROM printer_events').run();
         db.prepare('DELETE FROM jobs').run();
         db.prepare('DELETE FROM gcodes').run();
         db.prepare('DELETE FROM parts').run();
         db.prepare('DELETE FROM projects').run();
         db.prepare('DELETE FROM printers').run();
-        if (hasProjectTagLinks) db.prepare('DELETE FROM project_tag_links').run();
-        if (hasProjectTags)     db.prepare('DELETE FROM project_tags').run();
         if (hasFilamentColors) db.prepare('DELETE FROM filament_colors').run(); // before filament_types — FK on type_id
-        if (hasFilamentBrands) db.prepare('DELETE FROM filament_brands').run();
         if (hasFilamentTypes)  db.prepare('DELETE FROM filament_types').run();
         if (hasPrinterModels)  db.prepare('DELETE FROM printer_models').run();
         if (hasPrinterGroups)  db.prepare('DELETE FROM printer_groups').run();
@@ -194,11 +184,9 @@ module.exports = (db) => {
           printer_model:  makeInserter(db, 'printer_models', backup.printer_models || []),
           printer_group:  makeInserter(db, 'printer_groups', backup.printer_groups || []),
           filament_type:  makeInserter(db, 'filament_types', backup.filament_types || []),
-          filament_brand: makeInserter(db, 'filament_brands', backup.filament_brands || []),
           filament_color: makeInserter(db, 'filament_colors', backup.filament_colors || []),
-          project_tag:    makeInserter(db, 'project_tags', backup.project_tags || []),
-          project_tag_link: makeInserter(db, 'project_tag_links', backup.project_tag_links || []),
           setting:        makeInserter(db, 'settings', backup.settings || []),
+          ledger:         makeInserter(db, 'part_qty_ledger', backup.part_qty_ledger || []),
         };
 
         // printer_models before printers — printers.model refers to it logically
@@ -215,32 +203,20 @@ module.exports = (db) => {
         for (const e of (backup.printer_events || [])) stmts.printer_event.run(e);
         // filament_types before filament_colors — FK on type_id
         for (const t of (backup.filament_types  || [])) stmts.filament_type.run(t);
-        for (const b of (backup.filament_brands || [])) stmts.filament_brand.run(b);
         for (const c of (backup.filament_colors || [])) stmts.filament_color.run(c);
-        for (const t of (backup.project_tags || [])) stmts.project_tag.run(t);
-        for (const l of (backup.project_tag_links || [])) stmts.project_tag_link.run(l);
-        if (!hasProjectTagLinks) {
-          const preservedLinkInserter = db.prepare(`
-            INSERT OR IGNORE INTO project_tag_links (project_id, tag_id, created_at)
-            VALUES (@project_id, @tag_id, @created_at)
-          `);
-          for (const row of preservedProjectTagLinks) preservedLinkInserter.run(row);
-        }
-        if (!hasProjectTags) {
-          const preservedTagInserter = db.prepare(`
-            INSERT OR IGNORE INTO project_tags (id, name, created_at)
-            VALUES (@id, @name, @created_at)
-          `);
-          for (const row of preservedProjectTags) preservedTagInserter.run(row);
-        }
         for (const s of (backup.settings || [])) stmts.setting.run(s);
+        for (const l of (backup.part_qty_ledger || [])) stmts.ledger.run(l);
+
+        // Parts with no ledger rows (a backup from before the ledger existed) get the
+        // same one-time history rebuild as an upgraded install.
+        partLedger.rebuildMissingLedgers(db);
 
         // Sync auto-increment counters so new inserts don't collide
         for (const [table, col] of [
           ['printers', 'printers'], ['projects', 'projects'],
           ['parts', 'parts'], ['gcodes', 'gcodes'], ['jobs', 'jobs'],
-          ['printer_events', 'printer_events'],
-          ['filament_types', 'filament_types'], ['filament_brands', 'filament_brands'], ['filament_colors', 'filament_colors'],
+          ['printer_events', 'printer_events'], ['part_qty_ledger', 'part_qty_ledger'],
+          ['filament_types', 'filament_types'], ['filament_colors', 'filament_colors'],
         ]) {
           db.prepare(`
             INSERT OR REPLACE INTO sqlite_sequence (name, seq)
@@ -251,7 +227,7 @@ module.exports = (db) => {
 
       restore();
 
-      console.log(`[backup] Farm restored: ${backup.printers.length} printers, ${backup.projects.length} projects, ${backup.gcodes.length} gcodes, ${backup.jobs.length} jobs, ${(backup.printer_events || []).length} events, ${(backup.printer_models || []).length} printer models, ${(backup.printer_groups || []).length} groups, ${(backup.filament_types || []).length} filament types, ${(backup.filament_brands || []).length} filament brands, ${(backup.filament_colors || []).length} filament colors, ${(backup.project_tags || []).length} project tags, ${(backup.project_tag_links || []).length} project tag links`);
+      console.log(`[backup] Farm restored: ${backup.printers.length} printers, ${backup.projects.length} projects, ${backup.gcodes.length} gcodes, ${backup.jobs.length} jobs, ${(backup.printer_events || []).length} events, ${(backup.printer_models || []).length} printer models, ${(backup.printer_groups || []).length} groups, ${(backup.filament_types || []).length} filament types, ${(backup.filament_colors || []).length} filament colors, ${(backup.part_qty_ledger || []).length} ledger rows`);
 
       res.json({
         ok: true,
@@ -264,10 +240,8 @@ module.exports = (db) => {
         printer_models:  (backup.printer_models  || []).length,
         printer_groups:  (backup.printer_groups  || []).length,
         filament_types:  (backup.filament_types  || []).length,
-        filament_brands: (backup.filament_brands || []).length,
         filament_colors: (backup.filament_colors || []).length,
-        project_tags:    (backup.project_tags || []).length,
-        project_tag_links: (backup.project_tag_links || []).length,
+        part_qty_ledger: (backup.part_qty_ledger || []).length,
       });
     } catch (err) {
       console.error('[backup] restore error:', err);

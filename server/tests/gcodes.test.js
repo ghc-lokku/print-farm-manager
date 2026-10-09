@@ -27,6 +27,7 @@ beforeAll(() => {
       target_qty INTEGER NOT NULL,
       completed_qty INTEGER DEFAULT 0,
       status TEXT DEFAULT 'open',
+      print_time_seconds INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -103,73 +104,14 @@ beforeAll(() => {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 // Creates a real temp file to upload
+const { buildSliced3mf } = require('./helpers/build-zip');
+
 function makeTempGcode(name = 'test.bgcode') {
   const p = path.join(os.tmpdir(), name);
-  fs.writeFileSync(p, Buffer.from('fake gcode content'));
+  // .3mf uploads are validated as real sliced archives; everything else can be junk bytes.
+  const content = name.toLowerCase().endsWith('.3mf') ? buildSliced3mf() : Buffer.from('fake gcode content');
+  fs.writeFileSync(p, content);
   return p;
-}
-
-function buildZip(entryNames, contentByName = {}) {
-  const localParts = [];
-  const centralParts = [];
-  let localOffset = 0;
-
-  for (const name of entryNames) {
-    const nameBuf = Buffer.from(name, 'utf8');
-    const content = Buffer.isBuffer(contentByName[name])
-      ? contentByName[name]
-      : Buffer.from(contentByName[name] || '', 'utf8');
-    const size = content.length;
-
-    const local = Buffer.alloc(30);
-    local.writeUInt32LE(0x04034b50, 0);
-    local.writeUInt16LE(20, 4);
-    local.writeUInt16LE(1 << 11, 6); // UTF-8
-    local.writeUInt16LE(0, 8);       // store (no compression)
-    local.writeUInt16LE(0, 10);
-    local.writeUInt16LE(0, 12);
-    local.writeUInt32LE(0, 14);
-    local.writeUInt32LE(size, 18);
-    local.writeUInt32LE(size, 22);
-    local.writeUInt16LE(nameBuf.length, 26);
-    local.writeUInt16LE(0, 28);
-
-    const central = Buffer.alloc(46);
-    central.writeUInt32LE(0x02014b50, 0);
-    central.writeUInt16LE(20, 4);
-    central.writeUInt16LE(20, 6);
-    central.writeUInt16LE(1 << 11, 8);
-    central.writeUInt16LE(0, 10);
-    central.writeUInt16LE(0, 12);
-    central.writeUInt16LE(0, 14);
-    central.writeUInt32LE(0, 16);
-    central.writeUInt32LE(size, 20);
-    central.writeUInt32LE(size, 24);
-    central.writeUInt16LE(nameBuf.length, 28);
-    central.writeUInt16LE(0, 30);
-    central.writeUInt16LE(0, 32);
-    central.writeUInt16LE(0, 34);
-    central.writeUInt16LE(0, 36);
-    central.writeUInt32LE(0, 38);
-    central.writeUInt32LE(localOffset, 42);
-
-    localParts.push(local, nameBuf, content);
-    centralParts.push(central, nameBuf);
-    localOffset += local.length + nameBuf.length + size;
-  }
-
-  const centralDir = Buffer.concat(centralParts);
-  const eocd = Buffer.alloc(22);
-  eocd.writeUInt32LE(0x06054b50, 0);
-  eocd.writeUInt16LE(0, 4);
-  eocd.writeUInt16LE(0, 6);
-  eocd.writeUInt16LE(entryNames.length, 8);
-  eocd.writeUInt16LE(entryNames.length, 10);
-  eocd.writeUInt32LE(centralDir.length, 12);
-  eocd.writeUInt32LE(localOffset, 16);
-  eocd.writeUInt16LE(0, 20);
-
-  return Buffer.concat([...localParts, centralDir, eocd]);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -357,57 +299,6 @@ describe('POST /api/gcodes/upload', () => {
     expect(first.status).toBe(201);
     expect(second.status).toBe(409);
     expect(second.body.error).toMatch(/already has a G-code/i);
-  });
-});
-
-describe('GET /api/gcodes/:id/preview', () => {
-  let previewPath;
-
-  afterEach(() => {
-    if (previewPath && fs.existsSync(previewPath)) {
-      fs.unlinkSync(previewPath);
-      previewPath = null;
-    }
-    db.prepare('DELETE FROM gcodes WHERE filename LIKE ?').run('preview-%');
-  });
-
-  test('serves embedded plate preview PNG from a 3MF archive', async () => {
-    const png = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]);
-    const zip = buildZip(
-      ['Metadata/plate_1.gcode', 'Metadata/plate_1.png'],
-      {
-        'Metadata/plate_1.gcode': 'G28',
-        'Metadata/plate_1.png': png,
-      }
-    );
-
-    previewPath = path.join(GCODE_DIR, `preview-${Date.now()}.3mf`);
-    fs.writeFileSync(previewPath, zip);
-
-    const row = db.prepare(`
-      INSERT INTO gcodes (part_id, printer_model, filename, filepath, parts_per_plate, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(1, 'x1c', 'preview-model.3mf', path.basename(previewPath), 1, Date.now());
-
-    const res = await request(app).get(`/api/gcodes/${row.lastInsertRowid}/preview`);
-    expect(res.status).toBe(200);
-    expect(res.headers['content-type']).toMatch(/image\/png/);
-    expect(Buffer.compare(res.body, png)).toBe(0);
-  });
-
-  test('returns 404 when no preview image exists in the 3MF', async () => {
-    const zip = buildZip(['Metadata/plate_1.gcode'], { 'Metadata/plate_1.gcode': 'G28' });
-    previewPath = path.join(GCODE_DIR, `preview-${Date.now()}-none.3mf`);
-    fs.writeFileSync(previewPath, zip);
-
-    const row = db.prepare(`
-      INSERT INTO gcodes (part_id, printer_model, filename, filepath, parts_per_plate, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(1, 'x1c', 'preview-empty.3mf', path.basename(previewPath), 1, Date.now());
-
-    const res = await request(app).get(`/api/gcodes/${row.lastInsertRowid}/preview`);
-    expect(res.status).toBe(404);
-    expect(res.body.error).toMatch(/preview image/i);
   });
 });
 

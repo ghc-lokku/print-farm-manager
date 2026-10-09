@@ -30,6 +30,7 @@ beforeAll(() => {
       completed_qty INTEGER DEFAULT 0,
       status TEXT DEFAULT 'open',
       sort_order INTEGER NOT NULL DEFAULT 0,
+      print_time_seconds INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -204,42 +205,30 @@ describe('POST /api/projects/:id/reactivate', () => {
   test('reopens closed parts that have remaining qty', async () => {
     const res = await request(app).post(`/api/projects/${projectId}/reactivate`);
     expect(res.status).toBe(200);
-    expect(res.body.reopened_parts).toBe(3);
-    expect(res.body.reset_completed_qty).toBe(true);
+    expect(res.body.reopened_parts).toBe(1); // only closedPartialId qualifies
 
-    const allParts = db.prepare('SELECT * FROM parts WHERE project_id = ? ORDER BY sort_order ASC').all(projectId);
-    expect(allParts.every(part => part.status === 'open')).toBe(true);
-    expect(allParts.every(part => part.completed_qty === 0)).toBe(true);
+    const part = db.prepare('SELECT * FROM parts WHERE id = ?').get(closedPartialId);
+    expect(part.status).toBe('open');
   });
 
   test('does not reopen parts that are already at target qty', async () => {
     await request(app).post(`/api/projects/${projectId}/reactivate`);
     const part = db.prepare('SELECT * FROM parts WHERE id = ?').get(closedFullPartId);
-    expect(part.status).toBe('open');
-    expect(part.completed_qty).toBe(0);
+    expect(part.status).toBe('closed');
   });
 
-  test('resets all completed project parts to zero and requeues them', async () => {
+  test('returns nothing_to_reopen when all closed parts are at target', async () => {
+    // Bring the partial part up to target so nothing qualifies
     db.prepare('UPDATE parts SET completed_qty = target_qty WHERE id = ?').run(closedPartialId);
+    // Also close the open part at its target
     db.prepare('UPDATE parts SET completed_qty = target_qty, status = \'closed\' WHERE id = ?').run(openPartId);
 
     const res = await request(app).post(`/api/projects/${projectId}/reactivate`);
     expect(res.status).toBe(200);
-    expect(res.body.reopened_parts).toBe(3);
-    expect(res.body.reset_completed_qty).toBe(true);
-
-    const partial = db.prepare('SELECT * FROM parts WHERE id = ?').get(closedPartialId);
-    const open = db.prepare('SELECT * FROM parts WHERE id = ?').get(openPartId);
-    const full = db.prepare('SELECT * FROM parts WHERE id = ?').get(closedFullPartId);
-    expect(partial.status).toBe('open');
-    expect(partial.completed_qty).toBe(0);
-    expect(open.status).toBe('open');
-    expect(open.completed_qty).toBe(0);
-    expect(full.status).toBe('open');
-    expect(full.completed_qty).toBe(0);
-
+    expect(res.body.nothing_to_reopen).toBe(true);
+    // Project status should NOT have changed
     const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
-    expect(project.status).toBe('active');
+    expect(project.status).toBe('completed');
   });
 
   test('does not reopen parts that are currently open', async () => {

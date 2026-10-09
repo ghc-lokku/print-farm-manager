@@ -3,15 +3,16 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { openThreeMf } = require('../parse-3mf');
+const zip = require('../zip-reader');
+const { readSlicerMetadata } = require('../slicer-metadata');
 const router = express.Router();
 
 const GCODE_DIR = path.join(__dirname, '..', 'gcode');
 
-const storage = multer.diskStorage({
-  destination: GCODE_DIR,
-  filename: (_req, file, cb) => cb(null, Date.now() + '_' + file.originalname),
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 500 * 1024 * 1024 },
 });
-const upload = multer({ storage });
 
 function runUpload(req, res) {
   return new Promise((resolve, reject) => {
@@ -130,6 +131,33 @@ function contentTypeForName(name) {
   return 'application/octet-stream';
 }
 
+// Returns null when the file is valid for upload, otherwise an error string.
+function validateSliced3mf(buffer) {
+  let names;
+  try {
+    names = zip.listEntryNames(buffer);
+  } catch (_) {
+    names = null;
+  }
+  if (names === null) {
+    return 'This file is not a readable .3mf archive. Export it again from your slicer.';
+  }
+  if (names.includes('Metadata/plate_1.gcode')) return null;
+
+  const otherPlate = names.find((n) => /^Metadata\/plate_\d+\.gcode$/.test(n));
+  if (otherPlate) {
+    return `This .3mf contains ${otherPlate.replace('Metadata/', '')} but the farm prints plate_1. ` +
+      'In your slicer, export just the sliced plate (it becomes plate 1 in the exported file).';
+  }
+
+  return 'This .3mf contains no sliced G-code, so the printer would silently ignore it. ' +
+    'In Bambu Studio / Orca Slicer: Slice Plate first, then File > Export > Export plate sliced file.';
+}
+
+function buildStoredFilename(originalname) {
+  return `${Date.now()}_${originalname}`;
+}
+
 // scheduler is optional, only needed at runtime for sweepIdlePrinters after an upload
 // makes a part schedulable. Tests pass null so there is no live scheduler dependency.
 module.exports = (db, scheduler = null) => {
@@ -205,13 +233,18 @@ module.exports = (db, scheduler = null) => {
           allowed_groups, required_material, required_color, required_brand } = req.body;
 
     if (!part_id || !parts_per_plate || !printer_model) {
-      fs.unlinkSync(req.file.path);
       return res.status(400).json({ error: 'part_id, parts_per_plate, and printer_model are required' });
     }
 
     if (!db.prepare('SELECT 1 FROM printer_models WHERE model_id = ?').get(printer_model)) {
-      fs.unlinkSync(req.file.path);
       return res.status(400).json({ error: `Unknown model "${printer_model}". Add it in Settings → Printer Models first.` });
+    }
+
+    if (path.extname(req.file.originalname).toLowerCase() === '.3mf') {
+      const sliceError = validateSliced3mf(req.file.buffer);
+      if (sliceError) {
+        return res.status(400).json({ error: sliceError });
+      }
     }
 
     // Enforce uniqueness on (part_id, printer_model) at app layer
@@ -219,16 +252,26 @@ module.exports = (db, scheduler = null) => {
       'SELECT id FROM gcodes WHERE part_id = ? AND printer_model = ?'
     ).get(part_id, printer_model);
     if (existing) {
-      fs.unlinkSync(req.file.path);
       return res.status(409).json({
         error: `This Part already has a G-code for ${printer_model}. Delete the existing one before uploading a replacement.`,
       });
     }
 
+    const storedFilename = buildStoredFilename(req.file.originalname);
+    const storedPath = path.join(GCODE_DIR, storedFilename);
+    fs.writeFileSync(storedPath, req.file.buffer);
+
+    const fileMeta = readSlicerMetadata(storedPath, req.file.originalname);
+
+    const clientEstSecs = est_print_secs ? parseInt(est_print_secs, 10) : null;
+    const resolvedEstSecs = fileMeta.est_print_secs ?? (Number.isFinite(clientEstSecs) ? clientEstSecs : null);
+
+    const clientGrams = material_grams ? parseFloat(material_grams) : null;
+    const parsedMaterialGrams = fileMeta.material_grams ?? (Number.isFinite(clientGrams) ? clientGrams : null);
+
     // ams_slot: -1 = external spool, 0–N = AMS slot, null = not applicable (non-Bambu)
     const parsedAmsSlot = ams_slot !== undefined && ams_slot !== '' ? parseInt(ams_slot, 10) : null;
 
-    const parsedMaterialGrams = material_grams ? parseFloat(material_grams) : null;
     // allowed_groups: JSON array string e.g. '["MK4S Farm","XL Farm"]', or null = all groups
     const parsedAllowedGroups = allowed_groups && allowed_groups !== '' ? allowed_groups : null;
     const parsedRequiredMaterial = required_material && required_material !== '' ? required_material.trim() : null;
@@ -245,9 +288,9 @@ module.exports = (db, scheduler = null) => {
           part_id,
           printer_model,
           req.file.originalname,
-          req.file.filename,
+          storedFilename,
           parseInt(parts_per_plate, 10),
-          est_print_secs ? parseInt(est_print_secs, 10) : null,
+          resolvedEstSecs,
           parsedMaterialGrams,
           parsedAmsSlot,
           parsedAllowedGroups,
@@ -263,9 +306,9 @@ module.exports = (db, scheduler = null) => {
           part_id,
           printer_model,
           req.file.originalname,
-          req.file.filename,
+          storedFilename,
           parseInt(parts_per_plate, 10),
-          est_print_secs ? parseInt(est_print_secs, 10) : null,
+          resolvedEstSecs,
           parsedMaterialGrams,
           parsedAmsSlot,
           parsedAllowedGroups,
@@ -320,12 +363,22 @@ module.exports = (db, scheduler = null) => {
     const requiredColor      = 'required_color'      in req.body ? (req.body.required_color       || null) : gcode.required_color;
     const requiredBrand      = 'required_brand'      in req.body ? (req.body.required_brand       || null) : gcode.required_brand;
 
+    const targetingChanged =
+      allowedGroups !== gcode.allowed_groups ||
+      requiredMaterial !== gcode.required_material ||
+      requiredColor !== gcode.required_color ||
+      requiredBrand !== gcode.required_brand;
+
     if (hasRequiredBrand) {
       db.prepare('UPDATE gcodes SET est_print_secs = ?, material_grams = ?, allowed_groups = ?, required_material = ?, required_color = ?, required_brand = ? WHERE id = ?')
         .run(estPrintSecs, materialGrams, allowedGroups, requiredMaterial, requiredColor, requiredBrand, req.params.id);
     } else {
       db.prepare('UPDATE gcodes SET est_print_secs = ?, material_grams = ?, allowed_groups = ?, required_material = ?, required_color = ? WHERE id = ?')
         .run(estPrintSecs, materialGrams, allowedGroups, requiredMaterial, requiredColor, req.params.id);
+    }
+
+    if (scheduler && targetingChanged) {
+      scheduler.sweepIdlePrinters();
     }
 
     res.json(db.prepare('SELECT * FROM gcodes WHERE id = ?').get(req.params.id));

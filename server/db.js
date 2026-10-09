@@ -18,19 +18,6 @@ const db = new Database(path.join(dataDir, 'farm.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
-function parseProjectVariantFromName(name) {
-  const raw = String(name || '').trim();
-  const m = raw.match(/^(.*?)(?:\s*-\s*|\s*\()(?:(\d{2,3})\s*(?:%|percent))(?:\))?\s*$/i);
-  if (m) {
-    const familyName = (m[1] || '').trim();
-    const sizeNum = parseInt(m[2], 10);
-    if (familyName && Number.isFinite(sizeNum)) {
-      return { family_name: familyName, size_label: `${sizeNum}%`, size_rank: sizeNum };
-    }
-  }
-  return { family_name: raw, size_label: '100%', size_rank: 100 };
-}
-
 db.exec(`
   CREATE TABLE IF NOT EXISTS printers (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +29,6 @@ db.exec(`
     model       TEXT NOT NULL,
     status      TEXT DEFAULT 'UNKNOWN',
     is_held     INTEGER DEFAULT 1,
-    manual_hold INTEGER DEFAULT 0,
     is_active   INTEGER DEFAULT 1,
     created_at  INTEGER NOT NULL
   );
@@ -51,9 +37,6 @@ db.exec(`
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL,
     description TEXT,
-    family_name TEXT,
-    size_label  TEXT,
-    size_rank   INTEGER,
     status      TEXT DEFAULT 'draft',
     priority    INTEGER DEFAULT 0,
     created_at  INTEGER NOT NULL,
@@ -105,7 +88,6 @@ db.exec(`
 
 // Migrations for existing installs
 try { db.exec('ALTER TABLE printers ADD COLUMN is_active INTEGER DEFAULT 1'); } catch (_) {}
-try { db.exec('ALTER TABLE printers ADD COLUMN manual_hold INTEGER DEFAULT 0'); } catch (_) {}
 try { db.exec('ALTER TABLE printers ADD COLUMN decommissioned_at INTEGER'); } catch (_) {}
 try { db.exec('ALTER TABLE printers ADD COLUMN decommission_note TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE parts ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
@@ -123,60 +105,9 @@ try { db.exec('ALTER TABLE printers ADD COLUMN loaded_color TEXT'); } catch (_) 
 try { db.exec('ALTER TABLE gcodes ADD COLUMN allowed_groups TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE gcodes ADD COLUMN required_material TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE gcodes ADD COLUMN required_color TEXT'); } catch (_) {}
-try { db.exec('ALTER TABLE gcodes ADD COLUMN required_brand TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE projects ADD COLUMN required_material TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE projects ADD COLUMN required_color TEXT'); } catch (_) {}
-try { db.exec('ALTER TABLE projects ADD COLUMN required_brand TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE projects ADD COLUMN allowed_groups TEXT'); } catch (_) {}
-try { db.exec('ALTER TABLE projects ADD COLUMN family_name TEXT'); } catch (_) {}
-try { db.exec('ALTER TABLE projects ADD COLUMN size_label TEXT'); } catch (_) {}
-try { db.exec('ALTER TABLE projects ADD COLUMN size_rank INTEGER'); } catch (_) {}
-try { db.exec('ALTER TABLE gcodes ADD COLUMN plate_no INTEGER'); } catch (_) {}
-
-// Backfill project size metadata from naming convention once columns exist.
-try {
-  const rows = db.prepare(`
-    SELECT id, name, family_name, size_label, size_rank
-    FROM projects
-  `).all();
-  const update = db.prepare(`
-    UPDATE projects
-    SET family_name = ?, size_label = ?, size_rank = ?
-    WHERE id = ?
-  `);
-  for (const row of rows) {
-    const missingFamily = !row.family_name || !String(row.family_name).trim();
-    const missingSizeLabel = !row.size_label || !String(row.size_label).trim();
-    const missingSizeRank = row.size_rank == null;
-    if (!missingFamily && !missingSizeLabel && !missingSizeRank) continue;
-
-    const parsed = parseProjectVariantFromName(row.name);
-    update.run(
-      missingFamily ? parsed.family_name : row.family_name,
-      missingSizeLabel ? parsed.size_label : row.size_label,
-      missingSizeRank ? parsed.size_rank : row.size_rank,
-      row.id
-    );
-  }
-} catch (_) {}
-
-// Project tags and many-to-many links
-try {
-  db.exec(`CREATE TABLE IF NOT EXISTS project_tags (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL UNIQUE,
-    created_at  INTEGER NOT NULL
-  )`);
-} catch (_) {}
-
-try {
-  db.exec(`CREATE TABLE IF NOT EXISTS project_tag_links (
-    project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    tag_id      INTEGER NOT NULL REFERENCES project_tags(id) ON DELETE CASCADE,
-    created_at  INTEGER NOT NULL,
-    PRIMARY KEY (project_id, tag_id)
-  )`);
-} catch (_) {}
 
 // Printer models — source of truth for which models this farm supports.
 // New installs start empty; operator adds models in Settings.
@@ -283,72 +214,14 @@ try {
 } catch (_) {}
 
 try {
-  db.exec(`CREATE TABLE IF NOT EXISTS filament_brands (
-    id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    name  TEXT NOT NULL UNIQUE
-  )`);
-} catch (_) {}
-
-try {
   db.exec(`CREATE TABLE IF NOT EXISTS filament_colors (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     type_id   INTEGER NOT NULL REFERENCES filament_types(id),
     name      TEXT NOT NULL,
-    brand     TEXT,
     hex_color TEXT,
     UNIQUE(type_id, name)
   )`);
 } catch (_) {}
-
-try { db.exec('ALTER TABLE filament_colors ADD COLUMN brand TEXT'); } catch (_) {}
-
-// Seed managed brand list from existing filament color brand values.
-try {
-  const insertBrand = db.prepare('INSERT OR IGNORE INTO filament_brands (name) VALUES (?)');
-  const rows = db.prepare(`
-    SELECT DISTINCT TRIM(brand) AS brand
-    FROM filament_colors
-    WHERE brand IS NOT NULL AND TRIM(brand) != ''
-  `).all();
-  for (const row of rows) insertBrand.run(row.brand);
-} catch (_) {}
-
-// Move filament color uniqueness from (type_id, name) to (type_id, name, brand)
-// so farms can store the same color name for multiple brands.
-try {
-  const colorColumns = db.prepare('PRAGMA table_info(filament_colors)').all().map((c) => c.name);
-  if (!colorColumns.includes('type_id')) throw new Error('filament_colors.type_id missing');
-  const createSqlRow = db.prepare(`
-    SELECT sql
-    FROM sqlite_master
-    WHERE type = 'table' AND name = 'filament_colors'
-  `).get();
-  const createSql = String(createSqlRow?.sql || '');
-  const hasBrandUnique = /UNIQUE\s*\(\s*type_id\s*,\s*name\s*,\s*brand\s*\)/i.test(createSql);
-  if (!hasBrandUnique) {
-    db.exec('BEGIN');
-    db.exec(`
-      CREATE TABLE filament_colors_new (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        type_id   INTEGER NOT NULL REFERENCES filament_types(id),
-        name      TEXT NOT NULL,
-        brand     TEXT,
-        hex_color TEXT,
-        UNIQUE(type_id, name, brand)
-      )
-    `);
-    db.exec(`
-      INSERT INTO filament_colors_new (id, type_id, name, brand, hex_color)
-      SELECT id, type_id, name, brand, hex_color FROM filament_colors
-    `);
-    db.exec('DROP TABLE filament_colors');
-    db.exec('ALTER TABLE filament_colors_new RENAME TO filament_colors');
-    db.exec('COMMIT');
-    console.log('[db] Migrated filament_colors uniqueness to (type_id, name, brand)');
-  }
-} catch (_) {
-  try { db.exec('ROLLBACK'); } catch (_) {}
-}
 
 // Add type_id to filament_colors if missing (existing installs that predate this column)
 try {
@@ -427,5 +300,19 @@ try {
     }
   }
 } catch (_) {}
+
+// Part quantity ledger (audit trail behind parts.completed_qty). The table definition
+// lives in partLedger.js. The rebuild only touches parts with no ledger rows yet, so on
+// every start after the first it finds nothing to do. It never changes completed_qty.
+try {
+  const partLedger = require('./partLedger');
+  partLedger.ensureSchema(db);
+  const rebuilt = partLedger.rebuildMissingLedgers(db);
+  if (rebuilt.parts > 0) {
+    console.log(`[db] Part ledger rebuilt for ${rebuilt.parts} part(s): ${rebuilt.rebuiltRows} job row(s), ${rebuilt.baselineRows} baseline row(s)`);
+  }
+} catch (err) {
+  console.error('[db] Part ledger setup failed:', err.message);
+}
 
 module.exports = db;

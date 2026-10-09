@@ -4,6 +4,7 @@ const path    = require('path');
 const fs      = require('fs');
 const router  = express.Router();
 const { extractPlates } = require('../parse-3mf');
+const partLedger = require('../partLedger');
 
 const GCODE_DIR = path.join(__dirname, '..', 'gcode');
 
@@ -908,6 +909,7 @@ module.exports = (db, scheduler = null) => {
         UPDATE projects SET required_material = ?, required_color = ?, updated_at = ? WHERE id = ?
       `).run(mat, col, Date.now(), project.id);
     }
+    if (scheduler) scheduler.sweepIdlePrinters();
     res.json(db.prepare('SELECT * FROM projects WHERE id = ?').get(project.id));
   });
 
@@ -926,6 +928,7 @@ module.exports = (db, scheduler = null) => {
     db.prepare(`
       UPDATE projects SET allowed_groups = ?, updated_at = ? WHERE id = ?
     `).run(value, Date.now(), project.id);
+    if (scheduler) scheduler.sweepIdlePrinters();
     res.json(db.prepare('SELECT * FROM projects WHERE id = ?').get(project.id));
   });
 
@@ -1112,6 +1115,7 @@ module.exports = (db, scheduler = null) => {
           db.prepare('DELETE FROM gcodes WHERE id = ?').run(gcode.id);
         }
 
+        partLedger.deleteForPart(db, part.id);
         db.prepare('DELETE FROM parts WHERE id = ?').run(part.id);
       }
       db.prepare('DELETE FROM projects WHERE id = ?').run(project.id);
@@ -1152,37 +1156,43 @@ module.exports = (db, scheduler = null) => {
     });
   });
 
-  // POST /:id/reactivate — re-open a completed project for the next run.
-  // Treat this as a clean requeue: clear any past credits and reopen every part so it
-  // can dispatch again without forcing the operator to edit quantities by hand.
+  // POST /:id/reactivate — re-open a completed project.
+  // Reopens closed parts that still have remaining qty. Returns nothing_to_reopen: true
+  // if all parts are already at or above target so the UI can warn before dispatching nothing.
   router.post('/:id/reactivate', (req, res) => {
     const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
     if (!project) return res.status(404).json({ error: 'Project not found' });
 
     const now = Date.now();
-    const allParts = db.prepare('SELECT * FROM parts WHERE project_id = ? ORDER BY sort_order ASC, id ASC').all(project.id);
-    const reopenedParts = allParts.length;
+    const eligible = db.prepare(`
+      SELECT * FROM parts
+      WHERE project_id = ? AND status = 'closed' AND completed_qty < target_qty
+    `).all(project.id);
 
-    db.transaction(() => {
-      db.prepare(`
-        UPDATE parts
-        SET completed_qty = 0,
-            status = 'open',
-            updated_at = ?
-        WHERE project_id = ?
-      `).run(now, project.id);
+    const openRemaining = db.prepare(`
+      SELECT COUNT(*) AS count FROM parts
+      WHERE project_id = ? AND status = 'open' AND completed_qty < target_qty
+    `).get(project.id).count;
 
-      db.prepare("UPDATE projects SET status = 'active', updated_at = ? WHERE id = ?").run(now, project.id);
-    })();
+    if (eligible.length === 0 && openRemaining === 0) {
+      return res.json({ nothing_to_reopen: true, project });
+    }
 
-    console.log(`[server] Project ${project.id} "${project.name}" re-activated — ${reopenedParts} part(s) reset to zero and queued again`);
+    if (eligible.length > 0) {
+      const placeholders = eligible.map(() => '?').join(',');
+      db.prepare(`UPDATE parts SET status = 'open', updated_at = ? WHERE id IN (${placeholders})`)
+        .run(now, ...eligible.map((p) => p.id));
+    }
+
+    db.prepare("UPDATE projects SET status = 'active', updated_at = ? WHERE id = ?").run(now, project.id);
+
+    console.log(`[server] Project ${project.id} "${project.name}" re-activated — ${eligible.length} part(s) reopened`);
 
     if (scheduler) scheduler.sweepIdlePrinters();
 
     res.json({
       project: db.prepare('SELECT * FROM projects WHERE id = ?').get(project.id),
-      reopened_parts: reopenedParts,
-      reset_completed_qty: true,
+      reopened_parts: eligible.length,
     });
   });
 

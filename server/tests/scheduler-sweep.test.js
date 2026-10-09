@@ -514,6 +514,7 @@ describe('_sweepInBatches: ceiling interaction through the real wave loop', () =
         project_id INTEGER NOT NULL, name TEXT NOT NULL,
         target_qty INTEGER NOT NULL, completed_qty INTEGER DEFAULT 0,
         status TEXT DEFAULT 'open', sort_order INTEGER DEFAULT 0,
+        print_time_seconds INTEGER,
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
       );
       CREATE TABLE gcodes (
@@ -522,7 +523,6 @@ describe('_sweepInBatches: ceiling interaction through the real wave loop', () =
         filename TEXT NOT NULL, filepath TEXT NOT NULL,
         parts_per_plate INTEGER NOT NULL, ams_slot INTEGER,
         allowed_groups TEXT, required_material TEXT, required_color TEXT,
-        plate_no INTEGER,
         created_at INTEGER NOT NULL
       );
       CREATE TABLE jobs (

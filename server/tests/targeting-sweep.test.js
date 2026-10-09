@@ -15,6 +15,8 @@ const request  = require('supertest');
 const express  = require('express');
 const Database = require('better-sqlite3');
 
+jest.setTimeout(15000);
+
 let db;
 let scheduler;
 

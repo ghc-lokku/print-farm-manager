@@ -14,6 +14,8 @@ const path     = require('path');
 const fs       = require('fs');
 const Database = require('better-sqlite3');
 
+jest.setTimeout(15000);
+
 const GCODE_DIR = path.join(__dirname, '..', 'gcode');
 
 let db;

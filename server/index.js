@@ -18,6 +18,8 @@ const PrinterPoller  = require('./poller');
 const JobScheduler   = require('./scheduler');
 const notifications  = require('./notifications');
 const events         = require('./events');
+const partLedger     = require('./partLedger');
+const confirmCount   = require('./confirmCount');
 const backup         = require('./backup');
 
 const jobsRouter         = require('./routes/jobs')(db);
@@ -26,9 +28,9 @@ const dashboardRouter    = require('./routes/dashboard')(db);
 const settingsRouter     = require('./routes/settings')(db);
 const modelsRouter       = require('./routes/models')(db);
 const groupsRouter       = require('./routes/groups')(db);
-const projectTagsRouter  = require('./routes/project-tags')(db);
 const filamentsRouter    = require('./routes/filaments')(db);
 const printerJobsRouter  = require('./routes/printer-jobs')(db);
+const scheduleRouter     = require('./routes/schedule')(db);
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -43,8 +45,8 @@ app.use('/api/dashboard',       dashboardRouter);
 app.use('/api/settings',        settingsRouter);
 app.use('/api/models',          modelsRouter);
 app.use('/api/groups',          groupsRouter);
-app.use('/api/project-tags',    projectTagsRouter);
 app.use('/api/filaments',       filamentsRouter);
+app.use('/api/schedule',        scheduleRouter);
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -85,13 +87,13 @@ const server = app.listen(PORT, () => {
 
   const poller    = new PrinterPoller(db);
   const scheduler = new JobScheduler(db, poller);
-  const printersRouter = require('./routes/printers')(db, scheduler);
-  app.use('/api/printers', printersRouter);
 
-  // Mount projects, parts, and gcodes routers here so they have access to the
-  // scheduler: projects for complete/reactivate, parts for the sweep after adding a
-  // part (or raising target_qty) reactivates a completed project, gcodes for the sweep
-  // after an upload gives a part its first matching G-code.
+  // Mount printers, projects, parts, and gcodes routers here so they have access to the
+  // scheduler: printers for the sweep after a filament, group, or model edit makes an
+  // idle printer eligible, projects for complete/reactivate and targeting edits, parts
+  // for the sweep after adding a part (or raising target_qty) reactivates a completed
+  // project, gcodes for the sweep after an upload or a targeting edit.
+  app.use('/api/printers', require('./routes/printers')(db, scheduler));
   app.use('/api/projects', require('./routes/projects')(db, scheduler));
   app.use('/api/parts',    require('./routes/parts')(db, scheduler));
   app.use('/api/gcodes',   require('./routes/gcodes')(db, scheduler));
@@ -125,7 +127,7 @@ const server = app.listen(PORT, () => {
       return res.status(400).json({ error: 'ids array required' });
     }
     const placeholders = ids.map(() => '?').join(',');
-    db.prepare(`UPDATE printers SET is_held = 0, manual_hold = 0 WHERE id IN (${placeholders})`).run(...ids);
+    db.prepare(`UPDATE printers SET is_held = 0 WHERE id IN (${placeholders})`).run(...ids);
     const printers = db.prepare(`SELECT * FROM printers WHERE id IN (${placeholders}) AND is_active = 1`).all(...ids);
     const batchSetting = db.prepare("SELECT value FROM settings WHERE key = 'dispatch_batch_size'").get();
     const batchSize = batchSetting ? parseInt(batchSetting.value, 10) : 10;
@@ -143,7 +145,7 @@ const server = app.listen(PORT, () => {
     if (!printer) return res.status(404).json({ error: 'Printer not found' });
     db.prepare(`
       UPDATE printers
-      SET is_active = 1, is_held = 0, manual_hold = 0, decommissioned_at = NULL, decommission_note = NULL
+      SET is_active = 1, is_held = 0, decommissioned_at = NULL, decommission_note = NULL
       WHERE id = ?
     `).run(printer.id);
     events.insert(printer.id, 'recommission', req.body?.note ?? null);
@@ -186,38 +188,37 @@ const server = app.listen(PORT, () => {
       "SELECT * FROM jobs WHERE printer_id = ? AND status = 'uploading' ORDER BY created_at DESC LIMIT 1"
     ).get(printer.id);
 
-    const printingJobEarly = !uploadingJobEarly && db.prepare(
-      "SELECT id FROM jobs WHERE printer_id = ? AND status = 'printing' ORDER BY started_at DESC LIMIT 1"
-    ).get(printer.id);
-
-    let finishedJob = (uploadingJobEarly || printingJobEarly) ? null : db.prepare(`
-      SELECT * FROM jobs WHERE printer_id = ? AND status = 'finished'
-      ORDER BY finished_at DESC LIMIT 1
-    `).get(printer.id);
-
+    // The finished job a confirmation corrects (null when a pending uploading/printing
+    // job or a job stopped after the last finish takes priority; see the missed-finish
+    // path below). confirmCount.finishedConfirmTarget is the single copy of this rule,
+    // shared with GET /api/printers so the Fleet pre-fill names the same job.
+    //
     // A cancelled job newer than the last finished one means the printer was stopped
     // (STOPPED status) after its last normal finish. The stopped job is the one the
-    // operator is confirming — fall through to the missed-finish path below, which
+    // operator is confirming, so it falls through to the missed-finish path, which
     // resolves it via the cancelled lookup. Without this, confirmed_qty would be
     // misapplied as a delta against the older finished job's part.
-    if (finishedJob) {
-      const newerCancelled = db.prepare(`
-        SELECT 1 FROM jobs WHERE printer_id = ? AND status = 'cancelled' AND finished_at > ? LIMIT 1
-      `).get(printer.id, finishedJob.finished_at);
-      if (newerCancelled) finishedJob = null;
+    const finishedJob = confirmCount.finishedConfirmTarget(db, printer.id);
+
+    // The Fleet page sends the job_id it pre-filled the count for. If that is no longer
+    // the job this confirmation would correct, the printer changed since the page loaded:
+    // refuse before touching anything and let the operator re-confirm on fresh data.
+    const jobId = confirmCount.parseJobId(req.body);
+    if (confirmCount.jobIdMismatch(db, printer.id, jobId)) {
+      return res.status(409).json({ error: confirmCount.JOB_CHANGED_ERROR });
     }
 
     if (finishedJob) {
-      // Normal case: apply confirmed_qty delta if the operator adjusted the count.
+      // Normal case: apply the operator's confirmed count to the already-credited job.
+      // With a job_id it is the plate's total good count (idempotent); without one it is
+      // compared to parts_per_plate as before. See server/confirmCount.js.
       if (confirmed_qty != null) {
         const confirmedQty = parseInt(confirmed_qty, 10);
-        if (!isNaN(confirmedQty) && confirmedQty !== finishedJob.parts_per_plate) {
-          const delta = confirmedQty - finishedJob.parts_per_plate; // negative = fewer good parts
-          db.prepare(`
-            UPDATE parts SET completed_qty = MAX(0, completed_qty + ?), updated_at = ? WHERE id = ?
-          `).run(delta, now, finishedJob.part_id);
-
-          const part = db.prepare('SELECT * FROM parts WHERE id = ?').get(finishedJob.part_id);
+        const applied = confirmCount.applyConfirmedCount(db, {
+          job: finishedJob, printer, confirmedQty, total: jobId != null, via: 'Set Ready', now,
+        });
+        if (applied) {
+          const { part, delta } = applied;
           if (part.completed_qty < part.target_qty && part.status === 'closed') {
             db.prepare(`UPDATE parts SET status = 'open', updated_at = ? WHERE id = ?`).run(now, part.id);
             console.log(`[server] Part "${part.name}" reopened — confirmed qty reduced`);
@@ -272,12 +273,21 @@ const server = app.listen(PORT, () => {
         db.prepare(`UPDATE jobs SET status = 'finished', finished_at = ? WHERE id = ?`)
           .run(now, activeJob.id);
 
-        db.prepare(`
-          UPDATE parts SET completed_qty = completed_qty + ?, updated_at = ? WHERE id = ?
-        `).run(creditQty, now, activeJob.part_id);
-
-        const part = db.prepare('SELECT * FROM parts WHERE id = ?').get(activeJob.part_id);
         const label = printingJob ? 'missed-finish' : activeJob.status === 'cancelled' ? 'cancelled-confirmed-good' : 'MQTT-recovered finish';
+        const noteByLabel = {
+          'missed-finish':            'finish was missed by the server',
+          'cancelled-confirmed-good': 'job was stopped on the printer',
+          'MQTT-recovered finish':    'job was marked failed after a connection drop',
+        };
+        const part = partLedger.adjustPartQty(db, {
+          partId: activeJob.part_id,
+          delta: creditQty,
+          source: partLedger.SOURCES.OPERATOR_CONFIRM,
+          job: activeJob,
+          printer,
+          note: `Operator confirmed ${creditQty} of ${activeJob.parts_per_plate} good (Set Ready; ${noteByLabel[label]})`,
+          now,
+        });
         console.log(`[server] ${printer.name} ${label} confirmed good — Part "${part.name}" ${part.completed_qty}/${part.target_qty}`);
 
         if (part.completed_qty >= part.target_qty) {
@@ -310,9 +320,15 @@ const server = app.listen(PORT, () => {
               : uploadingJob.parts_per_plate;
             db.prepare("UPDATE jobs SET status = 'finished', finished_at = ?, started_at = COALESCE(started_at, ?) WHERE id = ?")
               .run(now, now, uploadingJob.id);
-            db.prepare("UPDATE parts SET completed_qty = completed_qty + ?, updated_at = ? WHERE id = ?")
-              .run(creditQty, now, uploadingJob.part_id);
-            const part = db.prepare('SELECT * FROM parts WHERE id = ?').get(uploadingJob.part_id);
+            const part = partLedger.adjustPartQty(db, {
+              partId: uploadingJob.part_id,
+              delta: creditQty,
+              source: partLedger.SOURCES.OPERATOR_CONFIRM,
+              job: uploadingJob,
+              printer,
+              note: `Operator confirmed ${creditQty} of ${uploadingJob.parts_per_plate} good (Set Ready; upload had stalled)`,
+              now,
+            });
             console.log(`[server] ${printer.name} upload-stalled job ${uploadingJob.id} confirmed finished — Part "${part.name}" ${part.completed_qty}/${part.target_qty}`);
             if (part.completed_qty >= part.target_qty) {
               db.prepare(`UPDATE parts SET status = 'closed', updated_at = ? WHERE id = ?`).run(now, part.id);
@@ -337,7 +353,7 @@ const server = app.listen(PORT, () => {
       }
     }
 
-    db.prepare('UPDATE printers SET is_held = 0, manual_hold = 0 WHERE id = ?').run(printer.id);
+    db.prepare('UPDATE printers SET is_held = 0 WHERE id = ?').run(printer.id);
     const updated = db.prepare('SELECT * FROM printers WHERE id = ?').get(printer.id);
     console.log(`[server] ${printer.name} set ready by operator — dispatching...`);
     scheduler.scheduleForPrinter(updated);
