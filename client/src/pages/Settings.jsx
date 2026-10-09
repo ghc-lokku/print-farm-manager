@@ -42,6 +42,17 @@ const CREDENTIAL_HELP = {
   'octoprint':        'API Key: in OctoPrint under Settings → API. If OctoPrint isn\'t on port 80 (commonly :5000), include the port in the IP field, e.g. 192.168.1.50:5000.',
 };
 
+// Bambu's filament editor has no hex field, so non-RFID spools are matched by
+// typing the same RGB numbers there. Values are derived from the stored hex.
+function hexToRgb(hex) {
+  if (!hex) return null;
+  const s = String(hex).trim().replace(/^#/, '');
+  const m = /^([0-9a-fA-F]{6})([0-9a-fA-F]{2})?$/.exec(s);
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+
 export default function Settings() {
   const [showToast, toastEl] = useToast();
   const [confirm, confirmModal] = useConfirm();
@@ -56,12 +67,16 @@ export default function Settings() {
   const [allModels, setAllModels] = useState([]);
   const [filamentTypes, setFilamentTypes] = useState([]);   // [{id, name}]
   const [filamentColors, setFilamentColors] = useState([]); // [{id, name, hex_color}]
+  const [filamentBrands, setFilamentBrands] = useState([]); // ["Polymaker", "Bambu", ...]
   const [allGroups, setAllGroups] = useState([]);           // [{name, created_at}]
+  const [allProjectTags, setAllProjectTags] = useState([]); // [{id, name, created_at}]
   const fetchModels = useCallback(() => {
     fetch('/api/models').then(r => r.json()).then(setAllModels).catch(() => {});
     fetch('/api/filaments/types').then(r => r.json()).then(setFilamentTypes).catch(() => {});
     fetch('/api/filaments/colors').then(r => r.json()).then(setFilamentColors).catch(() => {});
+    fetch('/api/filaments/brands').then(r => r.json()).then(setFilamentBrands).catch(() => {});
     fetch('/api/groups').then(r => r.json()).then(setAllGroups).catch(() => {});
+    fetch('/api/project-tags').then(r => r.json()).then(setAllProjectTags).catch(() => {});
   }, []);
   useEffect(() => { fetchModels(); }, [fetchModels]);
 
@@ -69,6 +84,12 @@ export default function Settings() {
   const [typeForm, setTypeForm] = useState({ name: '' });
   const [typeFormError, setTypeFormError] = useState(null);
   const [typeDeleteError, setTypeDeleteError] = useState({});
+  const [editingTypeId, setEditingTypeId] = useState(null);
+  const [editingTypeName, setEditingTypeName] = useState('');
+  const [typeEditError, setTypeEditError] = useState(null);
+  const [brandForm, setBrandForm] = useState({ name: '' });
+  const [brandFormError, setBrandFormError] = useState(null);
+  const [brandDeleteError, setBrandDeleteError] = useState({});
 
   async function handleAddType(e) {
     e.preventDefault();
@@ -102,9 +123,68 @@ export default function Settings() {
     }
   }
 
-  const [colorForm, setColorForm] = useState({ type_id: '', name: '', hex_color: '' });
+  async function handleSaveTypeEdit() {
+    if (!editingTypeId) return;
+    setTypeEditError(null);
+    try {
+      const res = await fetch(`/api/filaments/types/${editingTypeId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: editingTypeName }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to update type');
+      setEditingTypeId(null);
+      setEditingTypeName('');
+      fetchModels();
+      showToast('Filament type updated');
+    } catch (err) {
+      setTypeEditError(err.message);
+    }
+  }
+
+  async function handleAddBrand(e) {
+    e.preventDefault();
+    setBrandFormError(null);
+    try {
+      const res = await fetch('/api/filaments/brands', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: brandForm.name }),
+      });
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (_) {}
+      if (!res.ok) throw new Error(data?.error || 'Failed to add brand');
+      setBrandForm({ name: '' });
+      fetchModels();
+      showToast('Filament brand added');
+    } catch (err) {
+      setBrandFormError(err.message);
+    }
+  }
+
+  async function handleDeleteBrand(name) {
+    setBrandDeleteError(prev => ({ ...prev, [name]: null }));
+    try {
+      const res = await fetch(`/api/filaments/brands/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (_) {}
+      if (!res.ok) throw new Error(data?.error || 'Failed to delete');
+      fetchModels();
+      showToast(`"${name}" removed`);
+    } catch (err) {
+      setBrandDeleteError(prev => ({ ...prev, [name]: err.message }));
+    }
+  }
+
+  const [colorForm, setColorForm] = useState({ type_id: '', name: '', brand: '', hex_color: '' });
   const [colorFormError, setColorFormError] = useState(null);
   const [colorDeleteError, setColorDeleteError] = useState({});
+  const [editingColorId, setEditingColorId] = useState(null);
+  const [editingColorForm, setEditingColorForm] = useState({ type_id: '', name: '', brand: '', hex_color: '' });
+  const [colorEditError, setColorEditError] = useState(null);
 
   async function handleAddColor(e) {
     e.preventDefault();
@@ -116,12 +196,13 @@ export default function Settings() {
         body: JSON.stringify({
           type_id: parseInt(colorForm.type_id, 10),
           name: colorForm.name,
+          brand: colorForm.brand || null,
           hex_color: colorForm.hex_color || null,
         }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to add color');
-      setColorForm({ type_id: '', name: '', hex_color: '' });
+      setColorForm({ type_id: '', name: '', brand: '', hex_color: '' });
       fetchModels();
       showToast('Filament color added');
     } catch (err) {
@@ -141,6 +222,43 @@ export default function Settings() {
       setColorDeleteError(prev => ({ ...prev, [id]: err.message }));
     }
   }
+
+  async function handleSaveColorEdit() {
+    if (!editingColorId) return;
+    setColorEditError(null);
+    try {
+      const res = await fetch(`/api/filaments/colors/${editingColorId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type_id: parseInt(editingColorForm.type_id, 10),
+          name: editingColorForm.name,
+          brand: editingColorForm.brand || null,
+          hex_color: editingColorForm.hex_color || null,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to update color');
+      setEditingColorId(null);
+      setEditingColorForm({ type_id: '', name: '', brand: '', hex_color: '' });
+      fetchModels();
+      showToast('Filament color updated');
+    } catch (err) {
+      setColorEditError(err.message);
+    }
+  }
+
+  function copyColorValue(text, label) {
+    if (!navigator.clipboard) return showToast('Clipboard not available', 'error');
+    navigator.clipboard.writeText(text).then(
+      () => showToast(`Copied ${label} ${text}`),
+      () => showToast('Copy failed', 'error'),
+    );
+  }
+
+  const managedBrandNames = [...new Set(
+    [...filamentBrands, ...filamentColors.map((c) => c.brand).filter(Boolean)]
+  )].sort((a, b) => a.localeCompare(b));
 
   const [addForm, setAddForm] = useState({ name: '', ip: '', api_key: '', serial_number: '', model: '', group_name: '', type: 'prusa', loaded_material: '', loaded_color: '' });
   const [addResult, setAddResult] = useState(null);
@@ -262,6 +380,43 @@ export default function Settings() {
       fetchModels();
     } catch (err) {
       setGroupDeleteError(prev => ({ ...prev, [name]: err.message }));
+    }
+  }
+
+  // Project tags management
+  const [projectTagForm, setProjectTagForm] = useState({ name: '' });
+  const [projectTagFormError, setProjectTagFormError] = useState(null);
+  const [projectTagDeleteError, setProjectTagDeleteError] = useState({});
+
+  async function handleAddProjectTag(e) {
+    e.preventDefault();
+    setProjectTagFormError(null);
+    try {
+      const res = await fetch('/api/project-tags', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(projectTagForm),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || 'Failed to add tag');
+      if (!data) throw new Error('Invalid API response from /api/project-tags. Restart the server and try again.');
+      setProjectTagForm({ name: '' });
+      fetchModels();
+      showToast('Tag added');
+    } catch (err) {
+      setProjectTagFormError(err.message);
+    }
+  }
+
+  async function handleDeleteProjectTag(id) {
+    setProjectTagDeleteError(prev => ({ ...prev, [id]: null }));
+    try {
+      const res = await fetch(`/api/project-tags/${id}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || 'Failed to delete tag');
+      fetchModels();
+    } catch (err) {
+      setProjectTagDeleteError(prev => ({ ...prev, [id]: err.message }));
     }
   }
 
@@ -657,6 +812,70 @@ export default function Settings() {
         )}
       </section>
 
+      {/* Project Tags */}
+      <section style={{ background: '#1e2433', borderRadius: 10, padding: 20, marginBottom: 24, maxWidth: 640 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Project Tags</h2>
+        <p style={{ color: '#64748b', fontSize: 13, marginBottom: 16 }}>
+          Labels used to organize projects. Tags can be assigned on the Projects page and searched by name there.
+          Deleting a tag is blocked while any project still uses it.
+        </p>
+
+        {allProjectTags.length > 0 && (
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, marginBottom: 16 }}>
+            <thead>
+              <tr style={{ color: '#64748b', textAlign: 'left', borderBottom: '1px solid #334155' }}>
+                <th style={{ padding: '4px 8px' }}>Name</th>
+                <th style={{ padding: '4px 8px' }}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {allProjectTags.map(tag => (
+                <tr key={tag.id} style={{ borderBottom: '1px solid #1a2030' }}>
+                  <td style={{ padding: '6px 8px', color: '#e2e8f0' }}>{tag.name}</td>
+                  <td style={{ padding: '6px 8px' }}>
+                    <button
+                      onClick={() => handleDeleteProjectTag(tag.id)}
+                      style={{ background: 'none', border: '1px solid #7f1d1d', borderRadius: 4, color: '#f87171', fontSize: 12, padding: '2px 8px', cursor: 'pointer' }}
+                    >
+                      Delete
+                    </button>
+                    {projectTagDeleteError[tag.id] && (
+                      <span style={{ color: '#fca5a5', fontSize: 12, marginLeft: 8 }}>{projectTagDeleteError[tag.id]}</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+
+        {allProjectTags.length === 0 && (
+          <p style={{ color: '#475569', fontSize: 13, marginBottom: 16 }}>No project tags yet. Add your first below.</p>
+        )}
+
+        <form onSubmit={handleAddProjectTag} style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8, alignItems: 'end' }}>
+          <div>
+            <label style={{ display: 'block', fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>Name *</label>
+            <input
+              value={projectTagForm.name}
+              onChange={e => setProjectTagForm({ name: e.target.value })}
+              required
+              placeholder="rush"
+              style={inputStyle}
+            />
+          </div>
+          <button
+            type="submit"
+            style={{ background: '#2563eb', color: '#fff', border: 'none', borderRadius: 6, padding: '8px 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}
+          >
+            Add
+          </button>
+        </form>
+        {projectTagFormError && (
+          <div style={{ marginTop: 10, color: '#fca5a5', fontSize: 13 }}>{projectTagFormError}</div>
+        )}
+      </section>
+
       {/* Filament Library */}
       <section style={{ background: '#1e2433', borderRadius: 10, padding: 20, marginBottom: 24, maxWidth: 640 }}>
         <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Filament Library</h2>
@@ -677,14 +896,60 @@ export default function Settings() {
             <tbody>
               {filamentTypes.map(t => (
                 <tr key={t.id} style={{ borderBottom: '1px solid #1a2030' }}>
-                  <td style={{ padding: '6px 8px', color: '#e2e8f0' }}>{t.name}</td>
-                  <td style={{ padding: '6px 8px' }}>
-                    <button
-                      onClick={() => handleDeleteType(t.id, t.name)}
-                      style={{ background: 'none', border: '1px solid #7f1d1d', borderRadius: 4, color: '#f87171', fontSize: 12, padding: '2px 8px', cursor: 'pointer' }}
-                    >
-                      Delete
-                    </button>
+                  <td style={{ padding: '6px 8px', color: '#e2e8f0' }}>
+                    {editingTypeId === t.id ? (
+                      <input
+                        value={editingTypeName}
+                        onChange={e => setEditingTypeName(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter') handleSaveTypeEdit(); }}
+                        style={{ ...inputStyle, maxWidth: 220 }}
+                      />
+                    ) : t.name}
+                  </td>
+                  <td style={{ padding: '6px 8px', whiteSpace: 'nowrap', width: 104 }}>
+                    {editingTypeId === t.id ? (
+                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, width: 100, justifyContent: 'flex-start' }}>
+                        <button
+                          onClick={handleSaveTypeEdit}
+                          title={`Save type ${t.name}`}
+                          aria-label={`Save type ${t.name}`}
+                          style={{ background: '#1d4ed8', border: 'none', borderRadius: 4, color: '#fff', width: 28, height: 24, cursor: 'pointer', lineHeight: 1, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}
+                        >
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                            <path d="M4 4h13l3 3v13H4z" stroke="currentColor" strokeWidth="2" />
+                            <path d="M8 4v6h8V4" stroke="currentColor" strokeWidth="2" />
+                            <rect x="8" y="14" width="8" height="6" stroke="currentColor" strokeWidth="2" />
+                          </svg>
+                        </button>
+                        <button
+                          onClick={() => { setEditingTypeId(null); setTypeEditError(null); }}
+                          title={`Cancel edit for type ${t.name}`}
+                          aria-label={`Cancel edit for type ${t.name}`}
+                          style={{ background: 'none', border: '1px solid #7f1d1d', borderRadius: 4, color: '#f87171', fontSize: 14, width: 28, height: 24, cursor: 'pointer', lineHeight: 1 }}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    ) : (
+                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, width: 100, justifyContent: 'flex-start' }}>
+                        <button
+                          onClick={() => { setEditingTypeId(t.id); setEditingTypeName(t.name); setTypeEditError(null); }}
+                          title={`Edit type ${t.name}`}
+                          aria-label={`Edit type ${t.name}`}
+                          style={{ background: 'none', border: '1px solid #334155', borderRadius: 4, color: '#93c5fd', fontSize: 13, width: 28, height: 24, cursor: 'pointer', lineHeight: 1, verticalAlign: 'middle' }}
+                        >
+                          ✎
+                        </button>
+                        <button
+                          onClick={() => handleDeleteType(t.id, t.name)}
+                          title={`Delete type ${t.name}`}
+                          aria-label={`Delete type ${t.name}`}
+                          style={{ background: 'none', border: '1px solid #7f1d1d', borderRadius: 4, color: '#f87171', fontSize: 14, width: 28, height: 24, cursor: 'pointer', lineHeight: 1, verticalAlign: 'middle' }}
+                        >
+                          🗑
+                        </button>
+                      </div>
+                    )}
                     {typeDeleteError[t.id] && (
                       <span style={{ color: '#fca5a5', fontSize: 12, marginLeft: 8 }}>{typeDeleteError[t.id]}</span>
                     )}
@@ -694,6 +959,7 @@ export default function Settings() {
             </tbody>
           </table>
         )}
+        {typeEditError && <div style={{ marginTop: -6, marginBottom: 10, color: '#fca5a5', fontSize: 13 }}>{typeEditError}</div>}
         {filamentTypes.length === 0 && (
           <p style={{ color: '#475569', fontSize: 13, marginBottom: 12 }}>No types yet. Add your first below.</p>
         )}
@@ -717,41 +983,211 @@ export default function Settings() {
         </form>
         {typeFormError && <div style={{ marginTop: -16, marginBottom: 16, color: '#fca5a5', fontSize: 13 }}>{typeFormError}</div>}
 
-        {/* Filament Colors */}
-        <h3 style={{ fontSize: 14, fontWeight: 600, color: '#94a3b8', marginBottom: 10 }}>Colors</h3>
-        {filamentColors.length > 0 && (
+        {/* Filament Brands */}
+        <h3 style={{ fontSize: 14, fontWeight: 600, color: '#94a3b8', marginBottom: 10 }}>Brands</h3>
+        {filamentBrands.length > 0 && (
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, marginBottom: 12 }}>
             <thead>
               <tr style={{ color: '#64748b', textAlign: 'left', borderBottom: '1px solid #334155' }}>
-                <th style={{ padding: '4px 8px' }}>Type</th>
-                <th style={{ padding: '4px 8px' }}>Color</th>
                 <th style={{ padding: '4px 8px' }}>Name</th>
                 <th style={{ padding: '4px 8px' }}></th>
               </tr>
             </thead>
             <tbody>
-              {filamentColors.map(c => (
-                <tr key={c.id} style={{ borderBottom: '1px solid #1a2030' }}>
-                  <td style={{ padding: '6px 8px', color: '#64748b', fontSize: 12 }}>{c.type_name}</td>
-                  <td style={{ padding: '6px 8px' }}>
-                    <span style={{
-                      display: 'inline-block', width: 16, height: 16, borderRadius: '50%',
-                      background: c.hex_color || '#334155',
-                      border: '1px solid #475569',
-                      verticalAlign: 'middle',
-                    }} title={c.hex_color || 'no color set'} />
-                  </td>
-                  <td style={{ padding: '6px 8px', color: '#e2e8f0' }}>
-                    {c.name}
-                    {c.hex_color && <span style={{ color: '#475569', fontSize: 11, marginLeft: 8, fontFamily: 'monospace' }}>{c.hex_color}</span>}
-                  </td>
+              {filamentBrands.map((brand) => (
+                <tr key={brand} style={{ borderBottom: '1px solid #1a2030' }}>
+                  <td style={{ padding: '6px 8px', color: '#e2e8f0' }}>{brand}</td>
                   <td style={{ padding: '6px 8px' }}>
                     <button
-                      onClick={() => handleDeleteColor(c.id, c.name)}
-                      style={{ background: 'none', border: '1px solid #7f1d1d', borderRadius: 4, color: '#f87171', fontSize: 12, padding: '2px 8px', cursor: 'pointer' }}
+                      onClick={() => handleDeleteBrand(brand)}
+                      title={`Delete brand ${brand}`}
+                      aria-label={`Delete brand ${brand}`}
+                      style={{ background: 'none', border: '1px solid #7f1d1d', borderRadius: 4, color: '#f87171', fontSize: 14, width: 28, height: 24, cursor: 'pointer', lineHeight: 1 }}
                     >
-                      Delete
+                      🗑
                     </button>
+                    {brandDeleteError[brand] && (
+                      <span style={{ color: '#fca5a5', fontSize: 12, marginLeft: 8 }}>{brandDeleteError[brand]}</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {filamentBrands.length === 0 && (
+          <p style={{ color: '#475569', fontSize: 13, marginBottom: 12 }}>No brands yet. Add your first below.</p>
+        )}
+        <form onSubmit={handleAddBrand} style={{ display: 'flex', gap: 8, alignItems: 'flex-end', marginBottom: 24 }}>
+          <div style={{ flex: 1 }}>
+            <label style={{ display: 'block', fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>Brand name *</label>
+            <input
+              value={brandForm.name}
+              onChange={e => setBrandForm({ name: e.target.value })}
+              required
+              placeholder="e.g. Polymaker, Bambu"
+              style={inputStyle}
+            />
+          </div>
+          <button
+            type="submit"
+            style={{ background: '#2563eb', color: '#fff', border: 'none', borderRadius: 6, padding: '8px 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}
+          >
+            Add Brand
+          </button>
+        </form>
+        {brandFormError && <div style={{ marginTop: -16, marginBottom: 16, color: '#fca5a5', fontSize: 13 }}>{brandFormError}</div>}
+
+        {/* Filament Colors */}
+        <h3 style={{ fontSize: 14, fontWeight: 600, color: '#94a3b8', marginBottom: 10 }}>Colors</h3>
+        <p style={{ color: '#64748b', fontSize: 12.5, marginBottom: 10 }}>
+          Each color's RGB value is the number to type into the Bambu filament editor (which has no hex field) so a non-RFID spool reports the matching color over MQTT. Click the value to copy it.
+        </p>
+        {filamentColors.length > 0 && (
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, marginBottom: 12, tableLayout: 'fixed' }}>
+            <colgroup>
+              <col style={{ width: 84 }} />
+              <col style={{ width: 96 }} />
+              <col style={{ width: 48 }} />
+              <col style={{ width: 180 }} />
+              <col style={{ width: 118 }} />
+              <col style={{ width: 92 }} />
+            </colgroup>
+            <thead>
+              <tr style={{ color: '#64748b', textAlign: 'left', borderBottom: '1px solid #334155' }}>
+                <th style={{ padding: '4px 8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Type</th>
+                <th style={{ padding: '4px 8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Brand</th>
+                <th style={{ padding: '4px 8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Color</th>
+                <th style={{ padding: '4px 8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Name</th>
+                <th style={{ padding: '4px 8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>RGB</th>
+                <th style={{ padding: '4px 8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {filamentColors.map(c => (
+                <tr key={c.id} style={{ borderBottom: '1px solid #1a2030' }}>
+                  <td style={{ padding: '6px 8px', color: '#64748b', fontSize: 12, width: 90 }}>
+                    {editingColorId === c.id ? (
+                      <select
+                        value={editingColorForm.type_id}
+                        onChange={e => setEditingColorForm((p) => ({ ...p, type_id: e.target.value }))}
+                        style={{ ...inputStyle, width: '100%' }}
+                      >
+                        {filamentTypes.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                      </select>
+                    ) : c.type_name}
+                  </td>
+                  <td style={{ padding: '6px 8px', color: '#94a3b8', fontSize: 12, width: 110 }}>
+                    {editingColorId === c.id ? (
+                      <select
+                        value={editingColorForm.brand}
+                        onChange={e => setEditingColorForm((p) => ({ ...p, brand: e.target.value }))}
+                        style={{ ...inputStyle, width: '100%' }}
+                      >
+                        <option value="">Any</option>
+                        {managedBrandNames.map((b) => <option key={b} value={b}>{b}</option>)}
+                      </select>
+                    ) : (c.brand || 'Any')}
+                  </td>
+                  <td style={{ padding: '6px 8px', width: 46 }}>
+                    <span style={{
+                      display: 'inline-block', width: 16, height: 16, borderRadius: '50%',
+                      background: (editingColorId === c.id ? editingColorForm.hex_color : c.hex_color) || '#334155',
+                      border: '1px solid #475569',
+                      verticalAlign: 'middle',
+                    }} title={(editingColorId === c.id ? editingColorForm.hex_color : c.hex_color) || 'no color set'} />
+                  </td>
+                  <td style={{ padding: '6px 8px', color: '#e2e8f0', width: 180, verticalAlign: 'top', overflow: 'hidden' }}>
+                    {editingColorId === c.id ? (
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 6, alignItems: 'center', width: '100%' }}>
+                        <input
+                          value={editingColorForm.name}
+                          onChange={e => setEditingColorForm((p) => ({ ...p, name: e.target.value }))}
+                          style={{ ...inputStyle, width: '100%' }}
+                        />
+                        <input
+                          value={editingColorForm.hex_color}
+                          onChange={e => setEditingColorForm((p) => ({ ...p, hex_color: e.target.value }))}
+                          placeholder="#rrggbb"
+                          style={{ ...inputStyle, width: 110, fontFamily: 'monospace' }}
+                        />
+                      </div>
+                    ) : (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, width: '100%' }}>
+                        <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{c.name}</span>
+                        {c.hex_color && <span style={{ color: '#475569', fontSize: 11, fontFamily: 'monospace', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{c.hex_color}</span>}
+                      </div>
+                    )}
+                  </td>
+                  <td style={{ padding: '6px 8px', fontFamily: 'monospace', fontSize: 11, width: 118, verticalAlign: 'top', overflow: 'hidden' }}>
+                    {(() => {
+                      const rgb = hexToRgb(c.hex_color);
+                      if (!rgb) return <span style={{ color: '#475569' }}>no hex</span>;
+                      const rgbStr = `${rgb.r},${rgb.g},${rgb.b}`;
+                      return (
+                        <span
+                          style={{ display: 'inline-block', cursor: 'pointer', color: '#94a3b8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '100%' }}
+                          title="Click to copy RGB"
+                          onClick={() => copyColorValue(rgbStr, 'RGB')}
+                        >
+                          RGB {rgbStr}
+                        </span>
+                      );
+                    })()}
+                  </td>
+                  <td style={{ padding: '6px 8px', whiteSpace: 'nowrap', width: 104, verticalAlign: 'middle' }}>
+                    {editingColorId === c.id ? (
+                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, width: 100, justifyContent: 'flex-start' }}>
+                        <button
+                          onClick={handleSaveColorEdit}
+                          title={`Save color ${c.name}`}
+                          aria-label={`Save color ${c.name}`}
+                          style={{ background: '#1d4ed8', border: 'none', borderRadius: 4, color: '#fff', width: 28, height: 24, cursor: 'pointer', lineHeight: 1, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}
+                        >
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                            <path d="M4 4h13l3 3v13H4z" stroke="currentColor" strokeWidth="2" />
+                            <path d="M8 4v6h8V4" stroke="currentColor" strokeWidth="2" />
+                            <rect x="8" y="14" width="8" height="6" stroke="currentColor" strokeWidth="2" />
+                          </svg>
+                        </button>
+                        <button
+                          onClick={() => { setEditingColorId(null); setColorEditError(null); }}
+                          title={`Cancel edit for color ${c.name}`}
+                          aria-label={`Cancel edit for color ${c.name}`}
+                          style={{ background: 'none', border: '1px solid #7f1d1d', borderRadius: 4, color: '#f87171', fontSize: 14, width: 28, height: 24, cursor: 'pointer', lineHeight: 1 }}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    ) : (
+                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, width: 100, justifyContent: 'flex-start' }}>
+                        <button
+                          onClick={() => {
+                            setEditingColorId(c.id);
+                            setEditingColorForm({
+                              type_id: String(c.type_id),
+                              name: c.name,
+                              brand: c.brand || '',
+                              hex_color: c.hex_color || '',
+                            });
+                            setColorEditError(null);
+                          }}
+                          title={`Edit color ${c.name}`}
+                          aria-label={`Edit color ${c.name}`}
+                          style={{ background: 'none', border: '1px solid #334155', borderRadius: 4, color: '#93c5fd', fontSize: 13, width: 28, height: 24, cursor: 'pointer', lineHeight: 1, verticalAlign: 'middle' }}
+                        >
+                          ✎
+                        </button>
+                        <button
+                          onClick={() => handleDeleteColor(c.id, c.name)}
+                          title={`Delete color ${c.name}`}
+                          aria-label={`Delete color ${c.name}`}
+                          style={{ background: 'none', border: '1px solid #7f1d1d', borderRadius: 4, color: '#f87171', fontSize: 14, width: 28, height: 24, cursor: 'pointer', lineHeight: 1, verticalAlign: 'middle' }}
+                        >
+                          🗑
+                        </button>
+                      </div>
+                    )}
                     {colorDeleteError[c.id] && (
                       <span style={{ color: '#fca5a5', fontSize: 12, marginLeft: 8 }}>{colorDeleteError[c.id]}</span>
                     )}
@@ -761,10 +1197,11 @@ export default function Settings() {
             </tbody>
           </table>
         )}
+        {colorEditError && <div style={{ marginTop: -6, marginBottom: 10, color: '#fca5a5', fontSize: 13 }}>{colorEditError}</div>}
         {filamentColors.length === 0 && (
           <p style={{ color: '#475569', fontSize: 13, marginBottom: 12 }}>No colors yet. Add your first below.</p>
         )}
-        <form onSubmit={handleAddColor} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr auto auto', gap: 8, alignItems: 'flex-end' }}>
+        <form onSubmit={handleAddColor} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr auto auto', gap: 8, alignItems: 'flex-end' }}>
           <div>
             <label style={{ display: 'block', fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>Type *</label>
             <select
@@ -786,6 +1223,17 @@ export default function Settings() {
               placeholder="e.g. Black, Galaxy Red"
               style={inputStyle}
             />
+          </div>
+          <div>
+            <label style={{ display: 'block', fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>Brand (optional)</label>
+            <select
+              value={colorForm.brand}
+              onChange={e => setColorForm(p => ({ ...p, brand: e.target.value }))}
+              style={inputStyle}
+            >
+              <option value="">Any</option>
+              {managedBrandNames.map((b) => <option key={b} value={b}>{b}</option>)}
+            </select>
           </div>
           <div>
             <label style={{ display: 'block', fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>Hex (optional)</label>

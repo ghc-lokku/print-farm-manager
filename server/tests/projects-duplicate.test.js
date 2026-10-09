@@ -59,6 +59,7 @@ beforeAll(() => {
       allowed_groups   TEXT,
       required_material TEXT,
       required_color   TEXT,
+      plate_no         INTEGER,
       created_at       INTEGER NOT NULL
     );
   `);
@@ -114,8 +115,8 @@ function seedGcode(partId, basename, overrides = {}) {
   const now = Date.now();
   const row = db.prepare(`
     INSERT INTO gcodes (part_id, printer_model, filename, filepath, parts_per_plate,
-                        est_print_secs, material_grams, ams_slot, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        est_print_secs, material_grams, ams_slot, plate_no, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     partId,
     overrides.printer_model   ?? 'mk4s',
@@ -125,6 +126,7 @@ function seedGcode(partId, basename, overrides = {}) {
     overrides.est_print_secs  ?? 18660,
     overrides.material_grams  ?? 45.5,
     overrides.ams_slot        ?? null,
+    overrides.plate_no        ?? null,
     now
   );
   return row.lastInsertRowid;

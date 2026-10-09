@@ -24,6 +24,22 @@ function formatHours(ms) {
   return h >= 100 ? `${Math.round(h)}h` : `${h.toFixed(1)}h`;
 }
 
+function normalizeHex(value) {
+  if (!value) return null;
+  const s = String(value).trim().replace(/^#/, '').toUpperCase();
+  if (!/^[0-9A-F]{6}([0-9A-F]{2})?$/.test(s)) return null;
+  return s.length === 8 ? s.slice(0, 6) : s;
+}
+
+function formatAmsSlotLabel(slot) {
+  if (slot === -1) return 'External Spool';
+  const n = Number(slot);
+  if (!Number.isFinite(n) || n < 0) return `Slot ${slot}`;
+  const amsUnit = Math.floor(n / 4) + 1;
+  const tray = (n % 4) + 1;
+  return `AMS ${amsUnit}, Slot ${tray}`;
+}
+
 const EVENT_META = {
   decommission:  { label: 'Decommissioned', bg: '#7f1d1d', color: '#fca5a5' },
   recommission:  { label: 'Recommissioned', bg: '#14532d', color: '#86efac' },
@@ -91,6 +107,8 @@ export default function PrinterDetail() {
   const [filamentTypes, setFilamentTypes]   = useState([]);
   const [filamentColors, setFilamentColors] = useState([]);
   const [groups, setGroups]                 = useState([]);
+  const [amsSlots, setAmsSlots]             = useState([]);
+  const [loadingAms, setLoadingAms]         = useState(false);
   const [editingDetails, setEditingDetails] = useState(false);
   const [detailsDraft, setDetailsDraft]     = useState({});
   const [detailsError, setDetailsError]     = useState(null);
@@ -123,6 +141,30 @@ export default function PrinterDetail() {
 
   useEffect(() => { fetchData(); }, [fetchData]);
   useEffect(() => { fetchJobPage(jobPage); }, [fetchJobPage, jobPage]);
+
+  useEffect(() => {
+    if (!printer || printer.type !== 'bambu' || printer.is_active !== 1) {
+      setAmsSlots([]);
+      return;
+    }
+    setLoadingAms(true);
+    fetch(`/api/printers/${id}/ams`)
+      .then(r => (r.ok ? r.json() : []))
+      .then(setAmsSlots)
+      .catch(() => setAmsSlots([]))
+      .finally(() => setLoadingAms(false));
+  }, [id, printer]);
+
+  function resolveAmsColorName(slot) {
+    const slotHex = normalizeHex(slot.color);
+    if (!slotHex) return null;
+    const byType = filamentColors.find(c =>
+      c.type_name === slot.type && normalizeHex(c.hex_color) === slotHex
+    );
+    if (byType) return byType.name;
+    const anyType = filamentColors.find(c => normalizeHex(c.hex_color) === slotHex);
+    return anyType?.name || null;
+  }
 
   async function submitNote(e) {
     e.preventDefault();
@@ -497,6 +539,51 @@ export default function PrinterDetail() {
           </div>
         )}
       </div>
+
+      {/* Bambu AMS live inventory */}
+      {printer.type === 'bambu' && printer.is_active === 1 && (
+        <div style={{
+          background: '#131720', border: '1px solid #1e2433',
+          borderRadius: 8, padding: '12px 18px', marginBottom: 24,
+        }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#94a3b8', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+            Live AMS Slots
+          </div>
+
+          {loadingAms ? (
+            <p style={{ margin: 0, color: '#64748b', fontSize: 13 }}>Loading live AMS state…</p>
+          ) : amsSlots.length === 0 ? (
+            <p style={{ margin: 0, color: '#64748b', fontSize: 13 }}>
+              No live AMS tray data available. Ensure the printer is online and connected via LAN Mode.
+            </p>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 8 }}>
+              {amsSlots
+                .slice()
+                .sort((a, b) => a.slot - b.slot)
+                .map((slot) => {
+                  const colorName = resolveAmsColorName(slot);
+                  const colorHex = normalizeHex(slot.color);
+                  return (
+                    <div key={String(slot.slot)} style={{
+                      background: '#0f172a', border: '1px solid #1f2937', borderRadius: 6,
+                      padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 3,
+                    }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: '#cbd5e1' }}>{formatAmsSlotLabel(slot.slot)}</div>
+                      <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                        {slot.type || 'Unknown material'}
+                        {colorName ? ` · ${colorName}` : ''}
+                      </div>
+                      <div style={{ fontSize: 11, color: '#64748b', fontFamily: 'monospace' }}>
+                        {colorHex ? `#${colorHex}` : 'No color code'}
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Stats card */}
       {stats && (

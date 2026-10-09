@@ -24,7 +24,6 @@ Prefer Docker over a local Node.js install? `docker compose up --build print-far
 | [docs/database.md](database.md) | SQLite schema — all tables, column types, conventions, migrations |
 | [docs/poller.md](poller.md) | Printer polling loop, concurrency model, event emissions |
 | [docs/api.md](api.md) | All REST endpoints — request/response shapes, error codes |
-| [docs/schedule.md](schedule.md) | Forward schedule: projection engine, operator model (changeover and staffed hours), estimate precedence, freshness fingerprint |
 | [docs/web-app.md](web-app.md) | React client — pages, routing, layout, live-update pattern |
 | [docs/CHANGELOG.md](CHANGELOG.md) | Dated log of all implemented features and changes |
 | [docs/multi-brand.md](multi-brand.md) | Phase 6 design — driver abstraction for non-Prusa brands (Elegoo Centauri Carbon) |
@@ -39,19 +38,10 @@ print-farm-manager/
 ├── server/
 │   ├── index.js          # Express entry point
 │   ├── db.js             # SQLite connection + schema init + startup migrations
-│   ├── partLedger.js     # Part quantity ledger: every completed_qty change + audit trail
 │   ├── poller.js         # Printer polling loop (EventEmitter)
 │   ├── scheduler.js      # Job dispatch engine (EventEmitter)
-│   ├── candidate-query.js # Dispatch eligibility predicate, shared by scheduler + projection
-│   ├── projection.js     # Forward schedule projection (read-only)
-│   ├── schedule-state.js # Fingerprint of the schedule's inputs (client freshness)
-│   ├── slicer-metadata.js # Print time + weight read from .3mf / .gcode
-│   ├── zip-reader.js     # Minimal ZIP reader (a .3mf is a ZIP), no dependency
-│   ├── estimate-input.js # Shared "2h15m" / "45g" parsers for parts + gcodes routes
 │   ├── events.js         # Printer event log helper — insert(printerId, type, note)
 │   ├── notifications.js  # In-memory operator alert store
-│   ├── scripts/
-│   │   └── audit-dry-run.js  # Part ledger dry run on a DB snapshot + reconciliation check
 │   └── routes/
 │       ├── printers.js   # CRUD + CSV import + decommission/recommission
 │       ├── events.js     # GET/POST /api/printers/:id/events
@@ -62,7 +52,6 @@ print-farm-manager/
 │       ├── models.js     # Printer model registry CRUD
 │       ├── settings.js   # Key/value operator settings (dispatch_batch_size)
 │       ├── backup.js     # Farm export + restore
-│       ├── schedule.js   # Forward schedule projection + freshness version
 │       └── dashboard.js  # TV command center — single-endpoint fleet summary
 ├── client/
 │   ├── src/
@@ -70,15 +59,13 @@ print-farm-manager/
 │   │   ├── main.jsx      # React root
 │   │   └── pages/
 │   │       ├── Fleet.jsx          # Live printer grid
-│   │       ├── PrintQueue.jsx     # Open parts in dispatch order + matching printers
 │   │       ├── Printers.jsx       # All-printers directory
 │   │       ├── PrinterDetail.jsx  # Per-printer event timeline + notes
 │   │       ├── Decommissioned.jsx # Decommissioned printers + recommission
 │   │       ├── Settings.jsx       # CSV import, add printer, printer models
 │   │       ├── Dashboard.jsx      # Fleet summary (TV mode)
 │   │       ├── Projects.jsx       # Project/Part/G-code management
-│   │       ├── Jobs.jsx           # Job queue table (what already happened)
-│   │       └── Schedule.jsx       # Forward schedule (what happens next)
+│   │       └── Jobs.jsx           # Job queue table
 ├── docs/                 # This folder
 ├── .github/workflows/    # CI — see docs/docker-publish.md
 ├── ARCHITECTURE.md       # Full product spec and phase planning

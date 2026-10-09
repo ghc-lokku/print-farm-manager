@@ -6,7 +6,7 @@ No cloud. No subscriptions. No vendor lock-in.
 
 ![Dashboard — live fleet status and active projects](docs/images/dashboard.png)
 
-> **Security note:** This app has no built-in authentication. It is designed to run on a trusted local network only. Do not expose port 3000 (or 5173 in dev) to the internet — your printer API keys are served to any client that can reach the server. Run it behind your router's firewall or a local VPN.
+> **Security note:** This app has no built-in authentication. It is designed to run on a trusted local network only. Do not expose port 80 (or 3000/5173 in dev) to the internet — your printer API keys are served to any client that can reach the server. Run it behind your router's firewall or a local VPN.
 
 ---
 
@@ -114,7 +114,7 @@ services:
     container_name: print-farm-manager
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "80:3000"
     volumes:
       - farm-data:/app/server/data
       - farm-gcode:/app/server/gcode
@@ -130,7 +130,7 @@ docker compose up -d
 
 This same file works as a drop-in stack in Portainer (**Stacks → Add stack → Web editor**, paste it in, deploy) — no repo checkout needed there either.
 
-Open `http://localhost:3000` in a browser, or replace `localhost` with the machine's LAN IP to access it from any device on the network.
+Open `http://localhost` in a browser, or replace `localhost` with the machine's LAN IP to access it from any device on the network.
 
 **Updating** to the latest published image:
 
@@ -171,13 +171,13 @@ Without Compose, the equivalent `docker run` (published image) is:
 
 ```bash
 docker run -d --name print-farm-manager --restart unless-stopped \
-  -p 3000:3000 \
+  -p 80:3000 \
   -v farm-data:/app/server/data \
   -v farm-gcode:/app/server/gcode \
   ghcr.io/joeltelling/print-farm-manager:latest
 ```
 
-> Same security note as above applies inside Docker: only publish port 3000 to interfaces on your trusted LAN, not `0.0.0.0` on an internet-facing host.
+> Same security note as above applies inside Docker: only publish port 80 to interfaces on your trusted LAN, not `0.0.0.0` on an internet-facing host.
 
 ### Option B — Bare metal (Node.js on the host)
 
